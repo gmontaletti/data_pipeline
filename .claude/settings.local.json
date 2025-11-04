@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__r-btw__btw_tool_files_read_text_file",
+      "Bash(git add:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
