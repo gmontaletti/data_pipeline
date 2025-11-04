@@ -157,24 +157,38 @@ All outputs are written to `output/dashboard/`:
 ## Project Structure
 
 ```
-data_pipeline/
-├── R/                              # Function modules
-│   ├── data_loading.R             # Data loading and consolidation
-│   ├── transitions.R              # Core transition computation
-│   ├── aggregations.R             # Person-level and geographic aggregates
-│   ├── policy_aggregates.R        # Precomputed policy coverage
-│   ├── career_analysis.R          # Survival and career metrics
-│   ├── classifiers.R              # Classification lookups
-│   ├── transition_enrichment.R    # Labels and visualizations
-│   └── utils_geographic.R         # Geographic utilities
-├── _targets.R                      # Pipeline definition
-├── _targets/                       # Intermediate target objects (gitignored)
-├── output/                         # Output files (gitignored)
-│   └── dashboard/                 # Dashboard-ready datasets
-├── check_progress.sh              # Progress monitoring script
-├── update_data.sh                 # Pipeline execution script
-├── CLAUDE.md                       # Claude Code guidance
-└── README.md                       # This file
+funzioni/
+├── data_pipeline/                  # Main project (git repository)
+│   ├── R/                          # Function modules
+│   │   ├── data_loading.R         # Data loading and consolidation
+│   │   ├── transitions.R          # Core transition computation
+│   │   ├── aggregations.R         # Person-level and geographic aggregates
+│   │   ├── policy_aggregates.R    # Precomputed policy coverage
+│   │   ├── career_analysis.R      # Survival and career metrics
+│   │   ├── classifiers.R          # Classification lookups
+│   │   ├── transition_enrichment.R # Labels and visualizations
+│   │   └── utils_geographic.R     # Geographic utilities
+│   ├── _targets.R                  # Pipeline definition
+│   ├── _targets/                   # Intermediate objects (gitignored)
+│   ├── output/                     # Output files (gitignored)
+│   │   └── dashboard/             # Dashboard-ready datasets
+│   ├── check_progress.sh          # Progress monitoring script
+│   ├── update_data.sh             # Pipeline execution script
+│   ├── CLAUDE.md                   # Claude Code guidance
+│   ├── README.md                   # This file
+│   └── .gitignore                  # Git exclusions
+├── reference/                      # Reference materials (not in git)
+│   └── data_pipeline/             # Project-specific references
+│       ├── docs/                  # Technical documentation
+│       ├── papers/                # Research papers
+│       ├── notes/                 # Development notes
+│       └── README.md              # Reference directory guide
+├── shared_data/                    # Shared data directory
+│   ├── raw/                       # Raw input data
+│   │   └── indice.fst            # Employment data
+│   └── maps/                      # Geographic lookup tables
+│       └── comune_cpi_lookup.rds  # CPI mapping
+└── longworkR/                      # Development package dependency
 ```
 
 ## Key Concepts

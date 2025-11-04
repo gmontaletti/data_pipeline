@@ -84,6 +84,8 @@ tar_destroy()             # Clean all targets (use cautiously)
 
 **External package**: Requires `longworkR` package loaded from `~/Documents/funzioni/longworkR/` (development version)
 
+**Reference materials**: Non-code documentation and references stored at `../reference/data_pipeline/` (outside git repository)
+
 ## Output Structure
 
 All outputs written to `output/dashboard/`:
