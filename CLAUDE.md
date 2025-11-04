@@ -156,6 +156,107 @@ No formal test suite. Validation occurs via:
 
 **Obsolete CPI codes**: Add recoding logic in Phase 1.3 of _targets.R if new obsolete codes appear.
 
+## Git & GitHub Workflow
+
+### Repository Structure
+- **Remote**: github.com/gmontaletti/data_pipeline
+- **Branch strategy**: Main branch for stable releases, feature branches for development
+- **Ignored files**: _targets/, output/, *.fst, *.rds, *.qs (see .gitignore)
+
+### Common Git Operations
+
+**Check status and stage changes**:
+```bash
+git status                          # See what's changed
+git add R/transitions.R _targets.R  # Stage specific files
+git add .                           # Stage all changes (respects .gitignore)
+```
+
+**Commit with proper formatting**:
+```bash
+git commit -m "Brief summary (50 chars or less)
+
+Detailed explanation if needed. Use markdown formatting.
+- Bullet points for changes
+- Reference issues with #123
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+Co-Authored-By: Claude <noreply@anthropic.com>"
+```
+
+**Push and pull**:
+```bash
+git push                  # Push commits to remote
+git pull                  # Pull latest changes
+git push -u origin main   # First push (set upstream)
+```
+
+**Feature branch workflow**:
+```bash
+# Create feature branch
+git checkout -b feature/improve-policy-coverage
+
+# Work on changes, commit
+git add .
+git commit -m "Add quarterly policy aggregates"
+
+# Push branch
+git push -u origin feature/improve-policy-coverage
+
+# Create PR on GitHub, review, merge
+# Then clean up local branch
+git checkout main
+git pull
+git branch -d feature/improve-policy-coverage
+```
+
+**View history and diffs**:
+```bash
+git log --oneline --graph --decorate  # Compact history
+git diff                               # See unstaged changes
+git diff --staged                      # See staged changes
+git show <commit-hash>                 # View specific commit
+```
+
+### GitHub Setup (First Time)
+
+```bash
+# If repository doesn't exist on GitHub yet:
+# 1. Create new repository on GitHub (don't initialize with README)
+# 2. Add remote and push
+git remote add origin https://github.com/gmontaletti/data_pipeline.git
+git branch -M main
+git push -u origin main
+
+# If cloning existing repository:
+git clone https://github.com/gmontaletti/data_pipeline.git
+cd data_pipeline
+```
+
+### What Gets Committed
+- **YES**: R scripts (R/), pipeline definition (_targets.R), documentation (*.md), configuration (.gitignore)
+- **NO**: Data files (*.fst, *.rds), intermediate objects (_targets/), outputs (output/), R project artifacts
+
+### Handling Large Files
+If you need to track large files (not recommended for this project):
+```bash
+# Install git-lfs
+git lfs install
+
+# Track large file types
+git lfs track "*.png"
+git add .gitattributes
+```
+
+### Merge Conflicts in _targets.R
+When merging feature branches, _targets.R often has conflicts. To resolve:
+1. Open _targets.R in editor
+2. Look for conflict markers: `<<<<<<`, `======`, `>>>>>>`
+3. Keep both target definitions if they're independent
+4. Test pipeline: `tar_visnetwork()` to verify dependencies
+5. Stage and commit resolution
+
 ## Agent Usage
 
 Always use agents for complex tasks (per user instructions). When working with R libraries and functions, use btw MCP tools. Don't use btw for websites or standard APIs.
