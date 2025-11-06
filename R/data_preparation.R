@@ -356,13 +356,8 @@ apply_vecshift_consolidation <- function(prepared_data) {
   cat("APPLYING VECSHIFT CONSOLIDATION\n")
   cat("=" %+% rep("=", 50) %+% "\n")
 
-  # Assess data quality first
-  cat("Assessing data quality...\n")
-  quality_report <- vecshift::assess_data_quality(prepared_data)
-  print(quality_report)
-
   # Apply vecshift consolidation
-  cat("\nConsolidating overlapping spells...\n")
+  cat("Consolidating overlapping spells...\n")
   n_before <- nrow(prepared_data)
 
   consolidated <- vecshift::vecshift(prepared_data)
