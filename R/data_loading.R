@@ -2,7 +2,111 @@
 # Data loading and preparation functions for dashboard preprocessing
 # Author: Giampaolo Montaletti (giampaolo.montaletti@gmail.com)
 
-# 1. Load and consolidate data -----
+# 1. Combined consolidation and enrichment -----
+
+#' Consolidate and enrich prepared employment data
+#'
+#' Applies vecshift consolidation (for overlaps), adds unemployment periods,
+#' matches external events (DID/POL), then applies longworkR consolidation
+#' (for short gaps), and finally adds geographic/ATECO enrichment.
+#'
+#' @param prepared_data Prepared contract data from prepare_contracts()
+#' @param did_data DID data from load_raw_did()
+#' @param pol_data POL data from load_raw_pol()
+#' @param min_date Minimum date for unemployment periods (default: "2021-01-01")
+#' @param max_date Maximum date for unemployment periods (default: "2024-12-31")
+#' @param variable_handling How to handle variables during longworkR consolidation (default: "first")
+#'
+#' @return A data.table with fully consolidated and enriched employment history
+#'
+#' @details
+#' Processing steps:
+#' 1. Apply vecshift consolidation (handle overlapping spells)
+#' 2. Add unemployment periods between employment spells
+#' 3. Match DID/POL external events to unemployment spells
+#' 4. Apply longworkR consolidation (merge short gaps)
+#' 5. Add geographic (CPI) and ATECO standardization
+#'
+#' @export
+consolidate_and_enrich <- function(prepared_data,
+                                   did_data,
+                                   pol_data,
+                                   min_date = as.IDate("2021-01-01"),
+                                   max_date = as.IDate("2024-12-31"),
+                                   variable_handling = "first") {
+
+  cat("\n")
+  cat("=" %+% rep("=", 70) %+% "\n")
+  cat("CONSOLIDATE AND ENRICH PIPELINE\n")
+  cat("=" %+% rep("=", 70) %+% "\n\n")
+
+  # CRITICAL FIX: Ensure inputs are data.table after FST deserialization
+  data.table::setDT(prepared_data)
+  data.table::setDT(did_data)
+  data.table::setDT(pol_data)
+
+  # CRITICAL FIX: Ensure date columns are IDate after deserialization
+  # QS format may not preserve IDate type correctly when loading targets
+  # This prevents "storage mode of IDate is somehow no longer integer" errors
+  prepared_data[, inizio := as.IDate(inizio)]
+  prepared_data[, fine := as.IDate(fine)]
+
+  # Step 1: Vecshift consolidation (overlaps)
+  cat("STEP 1: Vecshift consolidation (overlapping spells)\n")
+  cat("-" %+% rep("-", 70) %+% "\n")
+  dt <- apply_vecshift_consolidation(prepared_data)
+
+  # Step 2: Add unemployment periods
+  cat("\nSTEP 2: Add unemployment periods\n")
+  cat("-" %+% rep("-", 70) %+% "\n")
+  dt <- pipeline_add_unemployment(dt, min_date = min_date, max_date = max_date)
+
+  # Step 3: Merge original attributes back
+  cat("\nSTEP 3: Merge original attributes\n")
+  cat("-" %+% rep("-", 70) %+% "\n")
+  dt <- pipeline_merge_attributes(dt, prepared_data)
+
+  # Step 4: Match external events (DID/POL)
+  cat("\nSTEP 4: Match external events (DID/POL)\n")
+  cat("-" %+% rep("-", 70) %+% "\n")
+  cat("  Matching DID and POL events with unemployment spells...\n")
+
+  # CRITICAL FIX: Ensure DID/POL date columns are IDate after deserialization
+  did_data[, DATA_EVENTO := as.IDate(DATA_EVENTO)]
+  pol_data[, DATA_INIZIO := as.IDate(DATA_INIZIO)]
+  pol_data[, DATA_FINE := as.IDate(DATA_FINE)]
+
+  dt <- pipeline_match_events(dt, did_data, pol_data)
+
+  # Step 5: LongworkR consolidation (short gaps)
+  cat("\nSTEP 5: LongworkR consolidation (short gaps)\n")
+  cat("-" %+% rep("-", 70) %+% "\n")
+  cat("  Applying consolidate_short_gaps()...\n")
+  n_before <- nrow(dt)
+  dt <- longworkR::consolidate_short_gaps(dt, variable_handling = variable_handling)
+  n_after <- nrow(dt)
+  n_consolidated <- n_before - n_after
+  pct_reduction <- 100 * n_consolidated / n_before
+  cat(sprintf("  ✓ Consolidated %s spells (%.1f%% reduction)\n",
+              format(n_consolidated, big.mark = ","), pct_reduction))
+
+  # Step 6: Add geographic and ATECO enrichment
+  cat("\nSTEP 6: Geographic and ATECO enrichment\n")
+  cat("-" %+% rep("-", 70) %+% "\n")
+  dt <- add_geo_and_ateco(dt)
+
+  cat("\n")
+  cat("=" %+% rep("=", 70) %+% "\n")
+  cat(sprintf("✓ PIPELINE COMPLETE: %s final spells for %s individuals\n",
+              format(nrow(dt), big.mark = ","),
+              format(dt[, data.table::uniqueN(cf)], big.mark = ",")))
+  cat("=" %+% rep("=", 70) %+% "\n\n")
+
+  return(dt)
+}
+
+
+# 2. Load and consolidate data (legacy) -----
 
 #' Load and consolidate employment data
 #'
@@ -64,7 +168,13 @@ load_and_consolidate_data <- function(input_path, variable_handling = "first") {
 }
 
 
-# 2. Standardize ATECO codes -----
+# 3. String concatenation helper -----
+
+# String concatenation operator for cleaner output formatting
+`%+%` <- function(a, b) paste0(a, b)
+
+
+# 4. Standardize ATECO codes -----
 
 #' Standardize ATECO codes to XX.Y format
 #'
@@ -129,7 +239,7 @@ standardize_ateco_3digit <- function(ateco_code) {
 }
 
 
-# 3. Add geographic and sector information -----
+# 5. Add geographic and sector information -----
 
 #' Add CPI and standardized ATECO information to employment data
 #'
@@ -138,7 +248,8 @@ standardize_ateco_3digit <- function(ateco_code) {
 #'
 #' @param dt A data.table containing employment spells
 #' @param belfiore_col Character string specifying the column name containing
-#'   Belfiore comune codes. Default is "COMUNE_LAVORATORE".
+#'   Belfiore comune codes. Default is "COMUNE_LAVORATORE" (comune di domicilio
+#'   del lavoratore, NON il comune dove lavora).
 #' @param ateco_col Character string specifying the column name containing
 #'   ATECO codes. Default is "ateco".
 #' @param add_cpi_name Logical. If TRUE, adds both cpi_code and cpi_name columns.

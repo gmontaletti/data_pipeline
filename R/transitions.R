@@ -16,7 +16,6 @@
 #'     \item cf: Person identifier
 #'     \item sesso: Gender (mode value)
 #'     \item eta: Age (mode value)
-#'     \item area: Geographic area (mode value)
 #'     \item cpi_code: CPI area code (mode value)
 #'     \item cpi_name: CPI area name (mode value)
 #'     \item istruzione: Education level (mode value)
@@ -65,7 +64,6 @@ extract_demographics <- function(dt) {
   anag <- dt[!is.na(sesso), .(
     sesso = fmode(sesso),
     eta = if ("eta" %in% names(dt)) fmode(eta) else NA_real_,
-    area = if ("area" %in% names(dt)) fmode(area) else NA_character_,
     cpi_code = if ("cpi_code" %in% names(dt)) fmode(cpi_code) else NA_character_,
     cpi_name = if ("cpi_name" %in% names(dt)) fmode(cpi_name) else NA_character_,
     istruzione = if ("istruzione" %in% names(dt)) fmode(istruzione) else NA_character_,
@@ -111,7 +109,6 @@ extract_demographics <- function(dt) {
 #'     \item from_sector: ATECO sector of origin job
 #'     \item to_sector: ATECO sector of destination job
 #'     \item unemployment_duration: Days between job end and next job start
-#'     \item area: Geographic area
 #'     \item cpi_code: CPI area code
 #'     \item cpi_name: CPI area name
 #'     \item month: Month of transition
@@ -153,17 +150,18 @@ compute_closed_transitions <- function(dt) {
   dt_employment <- dt[arco > 0]
   data.table::setorder(dt_employment, cf, inizio)
 
-  # For unemployment spells (NA area/cpi), inherit geography from previous employment spell
-  dt_employment[, `:=`(
-    prev_area = data.table::shift(area, type = "lag", fill = NA),
-    prev_cpi_code = data.table::shift(cpi_code, type = "lag", fill = NA),
-    prev_cpi_name = data.table::shift(cpi_name, type = "lag", fill = NA)
-  ), by = cf]
+  # For unemployment spells (NA cpi), inherit geography from previous employment spell
+  if ("cpi_code" %in% names(dt_employment)) {
+    dt_employment[, prev_cpi_code := data.table::shift(cpi_code, type = "lag", fill = NA), by = cf]
+    dt_employment[is.na(cpi_code), cpi_code := prev_cpi_code]
+    dt_employment[, prev_cpi_code := NULL]
+  }
 
-  dt_employment[is.na(area), area := prev_area]
-  dt_employment[is.na(cpi_code), cpi_code := prev_cpi_code]
-  dt_employment[is.na(cpi_name), cpi_name := prev_cpi_name]
-  dt_employment[, `:=`(prev_area = NULL, prev_cpi_code = NULL, prev_cpi_name = NULL)]
+  if ("cpi_name" %in% names(dt_employment)) {
+    dt_employment[, prev_cpi_name := data.table::shift(cpi_name, type = "lag", fill = NA), by = cf]
+    dt_employment[is.na(cpi_name), cpi_name := prev_cpi_name]
+    dt_employment[, prev_cpi_name := NULL]
+  }
 
   # Shift to get next employment spell
   dt_employment[, `:=`(
@@ -189,7 +187,6 @@ compute_closed_transitions <- function(dt) {
     unemployment_duration = as.numeric(next_inizio - fine),
     from_salary = retribuzione,
     to_salary = next_retribuzione,
-    area,
     cpi_code,
     cpi_name,
     month = data.table::month(fine),
@@ -229,7 +226,6 @@ compute_closed_transitions <- function(dt) {
 #'     \item from_sector: ATECO sector of last job
 #'     \item to_sector: NA (no next sector)
 #'     \item unemployment_duration: Days from job end to observation end
-#'     \item area: Geographic area
 #'     \item cpi_code: CPI area code
 #'     \item cpi_name: CPI area name
 #'     \item month: Month of transition
@@ -285,7 +281,6 @@ compute_open_transitions <- function(dt, observation_end = as.Date("2024-10-20")
     unemployment_duration = as.numeric(observation_end - fine),
     from_salary = retribuzione,
     to_salary = NA_real_,
-    area,
     cpi_code,
     cpi_name,
     month = data.table::month(fine),

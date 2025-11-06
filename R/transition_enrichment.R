@@ -13,9 +13,9 @@
 #' @param classifier A data.table with lookup labels. Must contain a code column
 #'   and a description column.
 #' @param code_col Character string specifying the name of the code column in
-#'   classifier. Default is "qualifica" for professions.
+#'   classifier. Default is "name" (used for professions).
 #' @param label_col Character string specifying the name of the label/description
-#'   column in classifier. Default is "descrizione".
+#'   column in classifier. Default is "label".
 #'
 #' @return A data.table with original columns plus:
 #'   \itemize{
@@ -32,16 +32,16 @@
 #' prof_labeled <- enrich_transition_matrix_with_labels(
 #'   profession_matrix,
 #'   classifiers$professioni,
-#'   code_col = "qualifica",
-#'   label_col = "descrizione"
+#'   code_col = "name",
+#'   label_col = "label"
 #' )
 #' }
 #'
 #' @export
 enrich_transition_matrix_with_labels <- function(transition_matrix,
                                                    classifier,
-                                                   code_col = "qualifica",
-                                                   label_col = "descrizione") {
+                                                   code_col = "name",
+                                                   label_col = "label") {
 
   if (!data.table::is.data.table(transition_matrix)) {
     stop("transition_matrix must be a data.table")

@@ -16,7 +16,7 @@
 #'
 #' @return A data.table with one row per person containing:
 #'   \itemize{
-#'     \item Demographics: cf, sesso, eta, cleta, area, cpi_code, cpi_name,
+#'     \item Demographics: cf, sesso, eta, cleta, cpi_code, cpi_name,
 #'       istruzione, professione, ateco_3digit
 #'     \item Transition stats: n_transitions_total, n_transitions_closed,
 #'       n_transitions_open, n_transitions_with_did, n_transitions_with_pol,
@@ -92,22 +92,23 @@ create_person_data <- function(anag, transitions, career_metrics, clusters) {
 
 # 2. Create geographic summaries -----
 
-#' Create geographic aggregates by area and CPI
+#' Create geographic aggregates by CPI
 #'
-#' Aggregates person-level data by geographic areas (area, CPI) and demographic
+#' Aggregates person-level data by CPI (Centro Per l'Impiego) and demographic
 #' groups, including transition counts from the transitions table.
 #'
 #' @param person_data A data.table with person-level data (from create_person_data())
 #' @param transitions A data.table with all transitions (for transition counts)
 #'
-#' @return A list with two data.tables:
-#'   \itemize{
-#'     \item area: Geographic aggregates by area
-#'     \item cpi: Geographic aggregates by CPI code
-#'   }
+#' @return A data.table with CPI-level geographic aggregates
 #'
 #' @details
 #' Each geographic aggregate contains:
+#' - cpi_code: CPI identifier code
+#' - cpi_name: CPI name (human-readable)
+#' - sesso: Gender (M/F/Tutti)
+#' - cleta: Age class (or "Tutti")
+#' - istruzione: Education level (or "Tutti")
 #' - n_persons: Number of individuals in the group
 #' - median_employment_rate: Median employment rate
 #' - median_stability: Median employment stability index
@@ -117,14 +118,12 @@ create_person_data <- function(anag, transitions, career_metrics, clusters) {
 #' - pct_university: Percentage with university education (only in "Tutti" aggregates)
 #'
 #' Aggregates are created for:
-#' 1. Each combination of area/CPI × demographics (sesso, cleta, istruzione)
+#' 1. Each combination of CPI × demographics (sesso, cleta, istruzione)
 #' 2. Overall totals with sesso="Tutti", cleta="Tutti", istruzione="Tutti"
 #'
 #' @examples
 #' \dontrun{
-#' geo_summaries <- create_geo_summaries(person_data, transitions)
-#' area_summary <- geo_summaries$area
-#' cpi_summary <- geo_summaries$cpi
+#' geo_summary <- create_geo_summaries(person_data, transitions)
 #' }
 #'
 #' @export
@@ -137,45 +136,7 @@ create_geo_summaries <- function(person_data, transitions) {
     stop("transitions must be a data.table")
   }
 
-  cat("Creating geographic aggregates...\n")
-
-  # Area-based summaries -----
-  cat("  Creating area-level aggregates...\n")
-
-  # Aggregate by area and demographic groups
-  geo_summary_area <- person_data[, .(
-    n_persons = .N,
-    median_employment_rate = median(employment_rate, na.rm = TRUE),
-    median_stability = median(employment_stability_index, na.rm = TRUE),
-    median_turnover = median(job_turnover_rate, na.rm = TRUE)
-  ), by = .(area, sesso, cleta, istruzione)]
-
-  # Overall area summaries (no demographic grouping)
-  geo_summary_area_total <- person_data[, .(
-    sesso = "Tutti",
-    cleta = "Tutti",
-    istruzione = "Tutti",
-    n_persons = .N,
-    median_employment_rate = median(employment_rate, na.rm = TRUE),
-    median_stability = median(employment_stability_index, na.rm = TRUE),
-    median_turnover = median(job_turnover_rate, na.rm = TRUE),
-    pct_female = sum(sesso == "F", na.rm = TRUE) / .N * 100,
-    pct_university = sum(istruzione == "universitaria", na.rm = TRUE) / .N * 100
-  ), by = area]
-
-  # Combine detailed and total
-  geo_summary_area <- data.table::rbindlist(
-    list(geo_summary_area, geo_summary_area_total),
-    fill = TRUE
-  )
-
-  # Add transition counts by area
-  transition_counts_area <- transitions[, .(n_transitions = .N), by = area]
-  geo_summary_area <- merge(geo_summary_area, transition_counts_area,
-                           by = "area", all.x = TRUE)
-  geo_summary_area[is.na(n_transitions), n_transitions := 0]
-
-  cat("    Created", nrow(geo_summary_area), "area-level aggregate rows\n")
+  cat("Creating geographic aggregates by CPI...\n")
 
   # CPI-based summaries -----
   cat("  Creating CPI-level aggregates...\n")
@@ -254,10 +215,7 @@ create_geo_summaries <- function(person_data, transitions) {
   cat("    Created", nrow(geo_summary_cpi), "CPI-level aggregate rows\n")
   cat("    Unique CPI areas:", data.table::uniqueN(geo_summary_cpi$cpi_code), "\n")
 
-  return(list(
-    area = geo_summary_area,
-    cpi = geo_summary_cpi
-  ))
+  return(geo_summary_cpi)
 }
 
 
@@ -265,24 +223,23 @@ create_geo_summaries <- function(person_data, transitions) {
 
 #' Create monthly time series data
 #'
-#' Aggregates transitions by month and geographic/demographic dimensions for
+#' Aggregates transitions by month and CPI/demographic dimensions for
 #' time series analysis and visualization.
 #'
 #' @param transitions A data.table with all transitions containing columns:
-#'   year, month, is_closed, is_open, has_did, has_pol, area, cpi_code, cpi_name,
+#'   year, month, is_closed, is_open, has_did, has_pol, cpi_code, cpi_name,
 #'   sesso, cleta, istruzione
 #'
-#' @return A list with two data.tables:
-#'   \itemize{
-#'     \item area: Monthly time series by area and demographics
-#'     \item cpi: Monthly time series by CPI and demographics
-#'   }
+#' @return A data.table with monthly time series by CPI and demographics
 #'
 #' @details
 #' Each monthly time series record contains:
 #' - year_month: Date (first day of month)
-#' - Geographic dimension (area or cpi_code/cpi_name)
-#' - Demographic dimensions (sesso, cleta, istruzione)
+#' - cpi_code: CPI identifier code
+#' - cpi_name: CPI name (human-readable)
+#' - sesso: Gender (M/F/Tutti)
+#' - cleta: Age class (or "Tutti")
+#' - istruzione: Education level (or "Tutti")
 #' - n_transitions_closed: Count of closed transitions
 #' - n_transitions_open: Count of open transitions
 #' - n_transitions_total: Total transition count
@@ -290,14 +247,12 @@ create_geo_summaries <- function(person_data, transitions) {
 #' - n_with_pol: Count with POL support
 #'
 #' Time series are created for:
-#' 1. Each combination of geography × month × demographics
+#' 1. Each combination of CPI × month × demographics
 #' 2. Overall monthly totals with "Tutti" for all demographic dimensions
 #'
 #' @examples
 #' \dontrun{
-#' timeseries <- create_monthly_timeseries(transitions)
-#' area_ts <- timeseries$area
-#' cpi_ts <- timeseries$cpi
+#' monthly_ts <- create_monthly_timeseries(transitions)
 #' }
 #'
 #' @export
@@ -313,42 +268,10 @@ create_monthly_timeseries <- function(transitions) {
     stop("Missing required columns: ", paste(missing_cols, collapse = ", "))
   }
 
-  cat("Creating monthly time series data...\n")
+  cat("Creating monthly time series data by CPI...\n")
 
   # Create year_month date column
   transitions[, year_month := as.Date(paste(year, month, "01", sep = "-"))]
-
-  # Area-based time series -----
-  cat("  Creating area-level monthly time series...\n")
-
-  monthly_timeseries_area <- transitions[, .(
-    n_transitions_closed = sum(is_closed),
-    n_transitions_open = sum(is_open),
-    n_transitions_total = .N,
-    n_with_did = sum(has_did, na.rm = TRUE),
-    n_with_pol = sum(has_pol, na.rm = TRUE)
-  ), by = .(year_month, area, sesso, cleta, istruzione)]
-
-  # Overall monthly summaries (no grouping)
-  monthly_area_total <- transitions[, .(
-    area = "Tutti",
-    sesso = "Tutti",
-    cleta = "Tutti",
-    istruzione = "Tutti",
-    n_transitions_closed = sum(is_closed),
-    n_transitions_open = sum(is_open),
-    n_transitions_total = .N,
-    n_with_did = sum(has_did, na.rm = TRUE),
-    n_with_pol = sum(has_pol, na.rm = TRUE)
-  ), by = year_month]
-
-  # Combine
-  monthly_timeseries_area <- data.table::rbindlist(
-    list(monthly_timeseries_area, monthly_area_total),
-    fill = TRUE
-  )
-
-  cat("    Created", nrow(monthly_timeseries_area), "area-level monthly rows\n")
 
   # CPI-based time series -----
   cat("  Creating CPI-level monthly time series...\n")
@@ -381,10 +304,7 @@ create_monthly_timeseries <- function(transitions) {
 
   cat("    Created", nrow(monthly_timeseries_cpi), "CPI-level monthly rows\n")
 
-  return(list(
-    area = monthly_timeseries_area,
-    cpi = monthly_timeseries_cpi
-  ))
+  return(monthly_timeseries_cpi)
 }
 
 
@@ -392,23 +312,22 @@ create_monthly_timeseries <- function(transitions) {
 
 #' Create policy support effectiveness summary
 #'
-#' Aggregates transitions to evaluate the effectiveness of DID and POL active
+#' Aggregates transitions by CPI to evaluate the effectiveness of DID and POL active
 #' labor market policies in reducing unemployment duration.
 #'
 #' @param transitions A data.table with all transitions containing columns:
-#'   unemployment_duration, has_did, has_pol, area, cpi_code, cpi_name,
+#'   unemployment_duration, has_did, has_pol, cpi_code, cpi_name,
 #'   sesso, cleta, istruzione
 #'
-#' @return A list with two data.tables:
-#'   \itemize{
-#'     \item area: Policy summary by area and demographics
-#'     \item cpi: Policy summary by CPI and demographics
-#'   }
+#' @return A data.table with policy summary by CPI and demographics
 #'
 #' @details
 #' Each policy summary record contains:
-#' - Geographic dimension (area or cpi_code/cpi_name)
-#' - Demographic dimensions (sesso, cleta, istruzione)
+#' - cpi_code: CPI identifier code
+#' - cpi_name: CPI name (human-readable)
+#' - sesso: Gender (M/F/Tutti)
+#' - cleta: Age class (or "Tutti")
+#' - istruzione: Education level (or "Tutti")
 #' - n_transitions: Total transition count
 #' - n_with_did: Count with DID support
 #' - n_with_pol: Count with POL support
@@ -426,8 +345,6 @@ create_monthly_timeseries <- function(transitions) {
 #' @examples
 #' \dontrun{
 #' policy_summary <- create_policy_summary(transitions)
-#' area_policy <- policy_summary$area
-#' cpi_policy <- policy_summary$cpi
 #' }
 #'
 #' @export
@@ -443,28 +360,10 @@ create_policy_summary <- function(transitions) {
     stop("Missing required columns: ", paste(missing_cols, collapse = ", "))
   }
 
-  cat("Creating policy support summary...\n")
+  cat("Creating policy support summary by CPI...\n")
 
   # Filter to transitions with unemployment duration (exclude NA)
   trans_with_unemp <- transitions[!is.na(unemployment_duration)]
-
-  # Area-based policy summary -----
-  cat("  Creating area-level policy summary...\n")
-
-  policy_summary_area <- trans_with_unemp[, .(
-    n_transitions = .N,
-    n_with_did = sum(has_did, na.rm = TRUE),
-    n_with_pol = sum(has_pol, na.rm = TRUE),
-    pct_with_did = sum(has_did, na.rm = TRUE) / .N * 100,
-    pct_with_pol = sum(has_pol, na.rm = TRUE) / .N * 100,
-    median_unemp_duration_all = median(unemployment_duration, na.rm = TRUE),
-    median_unemp_duration_with_did = median(unemployment_duration[has_did], na.rm = TRUE),
-    median_unemp_duration_no_did = median(unemployment_duration[!has_did], na.rm = TRUE),
-    median_unemp_duration_with_pol = median(unemployment_duration[has_pol], na.rm = TRUE),
-    median_unemp_duration_no_pol = median(unemployment_duration[!has_pol], na.rm = TRUE)
-  ), by = .(area, sesso, cleta, istruzione)]
-
-  cat("    Created area-level policy summary with", nrow(policy_summary_area), "rows\n")
 
   # CPI-based policy summary -----
   cat("  Creating CPI-level policy summary...\n")
@@ -484,8 +383,5 @@ create_policy_summary <- function(transitions) {
 
   cat("    Created CPI-level policy summary with", nrow(policy_summary_cpi), "rows\n")
 
-  return(list(
-    area = policy_summary_area,
-    cpi = policy_summary_cpi
-  ))
+  return(policy_summary_cpi)
 }

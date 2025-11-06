@@ -14,21 +14,26 @@
 #'   testing purposes. If FALSE, attempts to load from external files. Default
 #'   is FALSE.
 #'
-#' @return A list with three elements:
+#' @return A list with five elements:
 #'   \itemize{
 #'     \item professioni: Data.table mapping profession codes to labels
 #'     \item etichette_contratti: Data.table mapping contract type codes to descriptions
+#'     \item tipo_contratto: Full contract type table with harmonization mappings
 #'     \item settori: Data.table mapping ATECO 3-digit codes to sector names
+#'     \item territoriale: Data.table with geographic information (comune, provincia, regione)
 #'   }
 #'
 #' @details
-#' The function loads three types of classification data:
+#' The function loads five types of classification data:
 #'
 #' 1. **Profession codes**: Mapping of qualifica codes to profession descriptions
 #' 2. **Contract types**: Harmonized contract type codes with Italian descriptions
 #'    - Applies standardization to consolidate similar contract types
 #'    - Maps obsolete codes to current equivalents
 #' 3. **ATECO sectors**: 3-digit economic sector classifications (XX.Y format)
+#' 4. **Territorial data**: Geographic lookup with comune codes, provincie, and regioni
+#'    - Used for filtering by Lombardia region
+#'    - Maps comuni to provincie
 #'
 #' When use_mock = TRUE, the function generates simplified lookup tables suitable
 #' for testing without requiring external data files.
@@ -55,14 +60,15 @@ load_classifiers <- function(use_mock = FALSE) {
     cat("Creating mock classifiers for testing...\n")
 
     # Mock profession codes (CP2011 format matching actual data)
+    # IMPORTANT: Use 'name' and 'label' column names to match real data structure
     cla$professioni <- data.table::data.table(
-      qualifica = c(
+      name = c(
         "7.2.8", "7.1.5", "2.6.5", "2.6.4", "3.3.3", "8.1.4", "8.1.3", "8.4.3",
         "7.1.8", "7.1.7", "4.3.1", "4.2.2", "7.2.1", "5.2.2", "6.4.1", "7.2.7",
         "5.1.2", "5.5.2", "3.2.1", "8.2.2", "1.2.2", "2.5.1", "3.1.1", "4.1.1",
         "5.3.1", "6.1.3", "6.2.2", "7.3.1", "8.3.1"
       ),
-      descrizione = c(
+      label = c(
         "Commessi vendita ingrosso", "Addetti mensa ristorazione", "Tecnici costruzioni",
         "Tecnici industria", "Contabili amministrativi", "Operatori macchine ufficio",
         "Operatori inserimento dati", "Conducenti veicoli", "Addetti preparazione pasti",
@@ -90,6 +96,18 @@ load_classifiers <- function(use_mock = FALSE) {
         "Collaborazione Coordinata Continuativa",
         "Tirocinio"
       )
+    )
+
+    # Mock tipo_contratto (same as etichette for mock)
+    cla$tipo_contratto <- data.table::copy(cla$etichette_contratti)
+    cla$tipo_contratto[, TIPOLOGIA_CONTRATTUALE := COD_TIPOLOGIA_CONTRATTUALE]
+
+    # Mock territorial data
+    cla$territoriale <- data.table::data.table(
+      COD_COMUNE = c("C816F205", "C816F704", "C816B157", "C816H501"),
+      DES_REGIONE_PAUT = rep("LOMBARDIA", 4),
+      DES_PROVINCIA = c("MILANO", "MILANO", "BRESCIA", "BERGAMO"),
+      DES_COMUNE = c("Milano", "Sesto San Giovanni", "Brescia", "Bergamo")
     )
 
     # Mock ATECO 3-digit sector labels (matching actual data format)
@@ -158,20 +176,24 @@ load_classifiers <- function(use_mock = FALSE) {
     cat("Loading classifiers from external files...\n")
 
     # 1. Load profession codes
-    prof_path <- "../../progetti/datasets/codici_p.rds"
+    shared_data_dir <- ifelse(Sys.getenv("SHARED_DATA_DIR") == "",
+                              "~/Documents/funzioni/shared_data",
+                              Sys.getenv("SHARED_DATA_DIR"))
+    prof_path <- file.path(shared_data_dir, "classifiers/codici_p.rds")
+
     if (file.exists(prof_path)) {
       cla$professioni <- readRDS(prof_path)
       cat("  Loaded", nrow(cla$professioni), "profession codes\n")
     } else {
       warning("Profession codes file not found at: ", prof_path)
       cla$professioni <- data.table::data.table(
-        qualifica = character(0),
-        descrizione = character(0)
+        name = character(0),
+        label = character(0)
       )
     }
 
     # 2. Load and harmonize contract types
-    contract_path <- "../../progetti/datasets/Co_standards/CO.Allegati.Decreto.Gennaio.2024/Rev.087 - Allegati al DD Gennaio.2024/Rev.087-ST-Classificazioni-Standard.xls"
+    contract_path <- file.path(shared_data_dir, "classifiers/co_standards.xls")
 
     if (file.exists(contract_path)) {
       if (!requireNamespace("readxl", quietly = TRUE)) {
@@ -210,6 +232,9 @@ load_classifiers <- function(use_mock = FALSE) {
         default = COD_TIPOLOGIA_CONTRATTUALE
       )]
 
+      # Keep full tipo_contratto table for harmonization
+      cla$tipo_contratto <- tipo_contratto
+
       # Keep only harmonized codes (where code equals harmonized code)
       cla$etichette_contratti <- tipo_contratto[
         COD_TIPOLOGIA_CONTRATTUALE == TIPOLOGIA_CONTRATTUALE,
@@ -217,6 +242,7 @@ load_classifiers <- function(use_mock = FALSE) {
       ]
 
       cat("  Loaded", nrow(cla$etichette_contratti), "contract type labels\n")
+      cat("  Loaded", nrow(cla$tipo_contratto), "total contract type mappings\n")
 
     } else {
       warning("Contract types file not found at: ", contract_path)
@@ -226,8 +252,23 @@ load_classifiers <- function(use_mock = FALSE) {
       )
     }
 
-    # 3. Load ATECO 3-digit sector labels
-    ateco_path <- "../../progetti/all_base_scripts/data/Struttura-ATECO-2007-aggiornamento-2022.xlsx"
+    # 3. Load territorial data
+    terr_path <- file.path(shared_data_dir, "classifiers/territoriale.rds")
+
+    if (file.exists(terr_path)) {
+      cla$territoriale <- readRDS(terr_path) |> data.table::setDT()
+      cat("  Loaded", nrow(cla$territoriale), "territorial records\n")
+    } else {
+      warning("Territorial data file not found at: ", terr_path)
+      cla$territoriale <- data.table::data.table(
+        COD_COMUNE = character(0),
+        DES_REGIONE_PAUT = character(0),
+        DES_PROVINCIA = character(0)
+      )
+    }
+
+    # 4. Load ATECO 3-digit sector labels
+    ateco_path <- file.path(shared_data_dir, "classifiers/ateco_2022.xlsx")
 
     if (file.exists(ateco_path)) {
       if (!requireNamespace("readxl", quietly = TRUE)) {

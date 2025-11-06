@@ -17,7 +17,6 @@
 #'   - sesso: Gender
 #'   - cleta: Age class
 #'   - istruzione: Education level
-#'   - area: Geographic area
 #'   - cpi_code: CPI code
 #' @param freq Character: "month" or "quarter" for aggregation frequency
 #'
@@ -173,20 +172,19 @@ create_policy_coverage_by_demographics <- function(transitions) {
 
 #' Create policy coverage aggregates by geography
 #'
-#' Precomputes DID/POL coverage rates by geographic area and CPI.
+#' Precomputes DID/POL coverage rates by CPI (Centro Per l'Impiego).
 #' This eliminates aggregation in Panel 3 (Geographic Map) of the dashboard.
 #'
 #' @param transitions data.table with transition records including:
 #'   - has_did: Logical, whether transition has DID support
 #'   - has_pol: Logical, whether transition has POL support
-#'   - area: Geographic area
 #'   - cpi_code: CPI code
 #'   - cpi_name: CPI name
 #'
 #' @return data.table with columns:
-#'   - geo_level: "area" or "cpi"
-#'   - geo_code: Area or CPI code
-#'   - geo_name: Area or CPI name
+#'   - geo_level: "cpi"
+#'   - geo_code: CPI code
+#'   - geo_name: CPI name
 #'   - n_transitions: Total transitions
 #'   - n_with_did: Number with DID
 #'   - n_with_pol: Number with POL
@@ -200,20 +198,8 @@ create_policy_coverage_by_geography <- function(transitions) {
     stop("transitions must be a data.table")
   }
 
-  # By area
-  by_area <- transitions[!is.na(area), .(
-    geo_level = "area",
-    geo_code = area,
-    geo_name = area,  # Area code = area name in this dataset
-    n_transitions = .N,
-    n_with_did = sum(has_did, na.rm = TRUE),
-    n_with_pol = sum(has_pol, na.rm = TRUE)
-  ), by = area]
-  data.table::setnames(by_area, "area", "geo_code", skip_absent = TRUE)
-  by_area[, `:=`(geo_level = "area", geo_name = geo_code)]
-
   # By CPI
-  by_cpi <- transitions[!is.na(cpi_code), .(
+  geography <- transitions[!is.na(cpi_code), .(
     geo_level = "cpi",
     geo_code = cpi_code,
     geo_name = cpi_name[1],  # Take first non-NA name
@@ -221,14 +207,8 @@ create_policy_coverage_by_geography <- function(transitions) {
     n_with_did = sum(has_did, na.rm = TRUE),
     n_with_pol = sum(has_pol, na.rm = TRUE)
   ), by = .(cpi_code, cpi_name)]
-  data.table::setnames(by_cpi, c("cpi_code", "cpi_name"), c("geo_code", "geo_name"), skip_absent = TRUE)
-  by_cpi[, geo_level := "cpi"]
-
-  # Combine
-  geography <- data.table::rbindlist(list(
-    by_area[, .(geo_level, geo_code, geo_name, n_transitions, n_with_did, n_with_pol)],
-    by_cpi[, .(geo_level, geo_code, geo_name, n_transitions, n_with_did, n_with_pol)]
-  ))
+  data.table::setnames(geography, c("cpi_code", "cpi_name"), c("geo_code", "geo_name"), skip_absent = TRUE)
+  geography[, geo_level := "cpi"]
 
   # Calculate percentages
   geography[, `:=`(
