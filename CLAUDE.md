@@ -12,20 +12,41 @@ This is a data preprocessing pipeline for labor market transition analysis in Lo
 
 ## Pipeline Architecture
 
-The pipeline uses the `targets` framework (_targets.R) to orchestrate an 11-phase workflow:
+The pipeline uses the `targets` framework (_targets.R) to orchestrate a **DUAL-BRANCH workflow** that processes employment data in TWO parallel pipelines:
+
+### Branch Structure
+- **Residence Branch** (output/dashboard/): Filters by worker's residence (COMUNE_LAVORATORE) - *current behavior*
+- **Workplace Branch** (output/dashboard_workplace/): Filters by job location (COMUNE_SEDE_LAVORO) - *new analysis*
 
 ### Phase Flow
-1. **Data Loading & Consolidation** → Load raw employment data, consolidate overlapping spells
-2. **Load Classifiers** → Load contract types, professions, economic sector lookups
-3. **Compute Transitions** → Extract demographics, compute closed (employment→employment) and open (employment→unemployment) transitions, enrich with DID/POL policy flags
-4. **Create Transition Matrices** → Aggregate transitions by contract type, profession, sector (includes standard + 45-day lag variants)
-5. **Career Metrics & Survival** → Compute survival curves and career trajectory metrics
-6. **Career Clustering** → Cluster career trajectories and create person-level dataset
-7. **Geographic Aggregations** → Create summaries by area and CPI (Centro Per l'Impiego)
-8. **Time Series** → Generate monthly aggregates
-9. **Policy Summary** → Analyze DID/POL effectiveness
-10. **File Outputs** → Write FST (large datasets) and RDS (lookup tables) files to `output/dashboard/`
-11. **Validation Report** → Generate comprehensive validation summary
+
+**Phase 0: Load Raw Data** (shared)
+- Load `rap.fst` (raw contracts), `did.fst` (unemployment declarations), `pol.fst` (active labor market policies)
+
+**Phase 1: Prepare Data** (shared, before forking)
+- Load classifiers (contract types, professions, sectors, territorial data)
+- Harmonize contract codes (map obsolete codes to standard equivalents)
+- Standardize education levels
+- Select relevant columns
+- **KEY**: Both COMUNE_LAVORATORE and COMUNE_SEDE_LAVORO are preserved at this stage
+
+**Phase 2: FORK - Apply Location Filters**
+- Branch A: Filter by residence (COMUNE_LAVORATORE) → residence pipeline
+- Branch B: Filter by workplace (COMUNE_SEDE_LAVORO) → workplace pipeline
+
+**Phase 3-12: Parallel Processing** (both branches execute independently)
+
+Each branch then processes through:
+3. **Consolidate & Enrich** → Vecshift consolidation (overlaps) → Add unemployment periods → Match DID/POL events → LongworkR consolidation (short gaps) → Add CPI/ATECO enrichment
+4. **Compute Transitions** → Extract demographics, compute closed and open transitions, enrich with DID/POL
+5. **Create Transition Matrices** → Aggregate by contract type, profession, sector (standard + 45-day lag)
+6. **Career Metrics & Survival** → Compute survival curves and trajectory metrics
+7. **Career Clustering** → Cluster trajectories, create person-level dataset
+8. **Geographic Aggregations** → Summaries by area and CPI
+9. **Time Series** → Monthly aggregates
+10. **Policy Summary** → DID/POL effectiveness analysis
+11. **Policy Coverage Precomputations** → Dashboard performance optimizations
+12. **File Outputs** → Write to separate output directories
 
 ### 45-Day Lag Analysis
 The pipeline computes transition matrices in two variants:
@@ -34,12 +55,13 @@ The pipeline computes transition matrices in two variants:
 
 ## Key R Modules (R/ directory)
 
-- **data_loading.R**: Load data, consolidate employment spells, standardize ATECO codes, add CPI geographic info
+- **data_preparation.R**: NEW - Raw data loading, contract harmonization, location filtering, vecshift preparation
+- **data_loading.R**: Consolidate employment spells (vecshift + longworkR), standardize ATECO codes, add CPI geographic info
 - **transitions.R**: Core transition computation (closed/open), DID/POL enrichment, transition matrices
 - **aggregations.R**: Person-level data, geographic summaries, monthly time series, policy summaries
 - **policy_aggregates.R**: Precomputed policy coverage aggregates for dashboard performance
 - **career_analysis.R**: Survival analysis and career metrics computation
-- **classifiers.R**: Load contract type/profession/sector classification tables
+- **classifiers.R**: Load contract type/profession/sector/territorial classification tables
 - **transition_enrichment.R**: Add labels to transition matrices, create network visualizations, compute summary statistics
 - **utils_geographic.R**: Geographic utilities (CPI mapping via Belfiore codes)
 
@@ -76,19 +98,46 @@ tar_destroy()             # Clean all targets (use cautiously)
 
 ## Data Dependencies
 
-**Input**: Raw employment data at `~/Documents/funzioni/shared_data/raw/indice.fst` (or `$SHARED_DATA_DIR/raw/indice.fst`)
+**Raw Input Files** (in `shared_data/raw/`):
+- `rap.fst`: Raw employment contracts (all fields, before any filtering)
+- `did.fst`: Unemployment declarations (DID/NASPI data)
+- `pol.fst`: Active labor market policies participation
+
+### Data Coverage and Dual-Branch Filtering
+
+The pipeline now processes data in **TWO ways**:
+
+**Residence Branch (CURRENT BEHAVIOR)**:
+- Filters by `COMUNE_LAVORATORE` (worker's residence)
+- Dataset contains contracts of people **domiciled in Lombardy**
+- A person living in Lombardy who works outside the region is **INCLUDED**
+- A person living outside Lombardy who works in Lombardy is **EXCLUDED**
+
+**Workplace Branch (NEW ANALYSIS)**:
+- Filters by `COMUNE_SEDE_LAVORO` (job location)
+- Dataset contains contracts where **workplace is in Lombardy**
+- A person living outside Lombardy who works in Lombardy is **INCLUDED**
+- A person living in Lombardy who works outside the region is **EXCLUDED**
+
+**Geographic Coverage**: All 12 Lombard provinces: Milano, Brescia, Bergamo, Monza e Brianza, Varese, Como, Mantova, Pavia, Cremona, Lecco, Sondrio, Lodi
 
 **Lookup tables** (in shared_data/maps/):
 - `comune_cpi_lookup.rds`: Belfiore code → CPI mapping
 - Contract type, profession, sector classifiers (loaded via `load_classifiers()`)
 
-**External package**: Requires `longworkR` package loaded from `~/Documents/funzioni/longworkR/` (development version)
+**External packages**:
+- `longworkR` package from `~/Documents/funzioni/longworkR/` (development version)
+- `vecshift` package from `~/Documents/funzioni/vecshift/` (development version)
 
 **Reference materials**: Non-code documentation and references stored at `../reference/data_pipeline/` (outside git repository)
 
 ## Output Structure
 
-All outputs written to `output/dashboard/`:
+**Dual Output Directories**:
+- `output/dashboard/`: Residence-based analysis (current behavior)
+- `output/dashboard_workplace/`: Workplace-based analysis (new)
+
+Both directories contain identical file structures:
 
 **Large datasets (FST format)**:
 - `transitions.fst`: All transitions with full attributes (108M+ records)
