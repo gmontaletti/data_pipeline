@@ -106,6 +106,149 @@ consolidate_and_enrich <- function(prepared_data,
 }
 
 
+# 1.1. Consolidate employment (before filtering) -----
+
+#' Consolidate employment spells (without unemployment/DID/POL)
+#'
+#' Performs employment spell consolidation that should happen BEFORE geographic filtering:
+#' 1. Vecshift consolidation (overlaps) - creates minimal skeleton with id column
+#' 2. LongworkR consolidation (short gaps) - operates on skeleton only
+#'
+#' This function does NOT merge attributes, add unemployment, or match DID/POL.
+#' Those steps happen AFTER filtering via enrich_with_policies().
+#' Attributes are preserved in the original prepared_data for later merging.
+#'
+#' @export
+consolidate_employment <- function(prepared_data,
+                                   variable_handling = "first") {
+
+  cat("\n")
+  cat("=" %+% rep("=", 70) %+% "\n")
+  cat("CONSOLIDATE EMPLOYMENT (BEFORE FILTERING)\n")
+  cat("=" %+% rep("=", 70) %+% "\n\n")
+
+  # CRITICAL FIX: Ensure inputs are data.table after FST deserialization
+  data.table::setDT(prepared_data)
+
+  # CRITICAL FIX: Ensure date columns are IDate after deserialization
+  prepared_data[, inizio := as.IDate(inizio)]
+  prepared_data[, fine := as.IDate(fine)]
+
+  # Step 1: Vecshift consolidation (overlaps) - creates skeleton with id column
+  cat("STEP 1: Vecshift consolidation (overlapping spells)\n")
+  cat("-" %+% rep("-", 70) %+% "\n")
+  dt <- apply_vecshift_consolidation(prepared_data)
+
+  # Step 2: LongworkR consolidation (short gaps) - on skeleton only
+  cat("\nSTEP 2: LongworkR consolidation (short gaps)\n")
+  cat("-" %+% rep("-", 70) %+% "\n")
+  cat("  Applying consolidate_short_gaps()...\n")
+  n_before <- nrow(dt)
+  dt <- longworkR::consolidate_short_gaps(dt, variable_handling = variable_handling)
+  n_after <- nrow(dt)
+  n_consolidated <- n_before - n_after
+  pct_reduction <- 100 * n_consolidated / n_before
+  cat(sprintf("  ✓ Consolidated %s spells (%.1f%% reduction)\n",
+              format(n_consolidated, big.mark = ","), pct_reduction))
+
+  cat("\n")
+  cat("=" %+% rep("=", 70) %+% "\n")
+  cat(sprintf("✓ CONSOLIDATION COMPLETE: %s spells for %s individuals\n",
+              format(nrow(dt), big.mark = ","),
+              format(dt[, data.table::uniqueN(cf)], big.mark = ",")))
+  cat("  Note: Attributes will be merged after filtering + unemployment\n")
+  cat("=" %+% rep("=", 70) %+% "\n\n")
+
+  return(dt)
+}
+
+
+# 1.2. Enrich with policies (after filtering) -----
+
+#' Enrich filtered data with unemployment periods and DID/POL events
+#'
+#' Performs enrichment steps that should happen AFTER geographic filtering:
+#' 1. Add unemployment periods between employment spells
+#' 2. Merge original attributes back (employment gets attributes from prepared_data)
+#' 3. Match DID/POL external events to unemployment spells
+#' 4. Add geographic (CPI) and ATECO standardization
+#'
+#' This function operates on already-filtered employment data, ensuring that
+#' unemployment spells are only created for the filtered population.
+#'
+#' @export
+enrich_with_policies <- function(filtered_data,
+                                  prepared_data,
+                                  did_data,
+                                  pol_data,
+                                  min_date = as.IDate("2021-01-01"),
+                                  max_date = as.IDate("2024-12-31")) {
+
+  cat("\n")
+  cat("=" %+% rep("=", 70) %+% "\n")
+  cat("ENRICH WITH POLICIES (AFTER FILTERING)\n")
+  cat("=" %+% rep("=", 70) %+% "\n\n")
+
+  # CRITICAL FIX: Ensure inputs are data.table after deserialization
+  data.table::setDT(filtered_data)
+  data.table::setDT(prepared_data)
+  data.table::setDT(did_data)
+  data.table::setDT(pol_data)
+
+  # CRITICAL FIX: Ensure date columns are IDate
+  filtered_data[, inizio := as.IDate(inizio)]
+  filtered_data[, fine := as.IDate(fine)]
+
+  # Step 1: Add unemployment periods
+  cat("STEP 1: Add unemployment periods\n")
+  cat("-" %+% rep("-", 70) %+% "\n")
+  dt <- pipeline_add_unemployment(filtered_data, min_date = min_date, max_date = max_date)
+
+  # Step 2: Merge original attributes back
+  cat("\nSTEP 2: Merge original attributes\n")
+  cat("-" %+% rep("-", 70) %+% "\n")
+  dt <- pipeline_merge_attributes(dt, prepared_data)
+
+  # Step 3: Match external events (DID/POL)
+  cat("\nSTEP 3: Match external events (DID/POL)\n")
+  cat("-" %+% rep("-", 70) %+% "\n")
+  cat("  Matching DID and POL events with unemployment spells...\n")
+
+  # CRITICAL FIX: Ensure DID/POL date columns are IDate after deserialization
+  did_data[, DATA_EVENTO := as.IDate(DATA_EVENTO)]
+  pol_data[, DATA_INIZIO := as.IDate(DATA_INIZIO)]
+  pol_data[, DATA_FINE := as.IDate(DATA_FINE)]
+
+  dt <- pipeline_match_events(dt, did_data, pol_data)
+
+  # Step 4: Add geographic and ATECO enrichment
+  cat("\nSTEP 4: Geographic and ATECO enrichment\n")
+  cat("-" %+% rep("-", 70) %+% "\n")
+  dt <- add_geo_and_ateco(dt)
+
+  # Step 5: Recode obsolete CPI codes
+  cat("\nSTEP 5: Recode obsolete CPI codes\n")
+  cat("-" %+% rep("-", 70) %+% "\n")
+  if ("cpi_code" %in% names(dt)) {
+    dt[cpi_code == "C816C530490", cpi_code := "C816C000692"]
+    dt[cpi_code == "C816C000692",
+       cpi_name := "CPI DELLA PROVINCIA DI LODI - UFFICIO PERIFERICO CODOGNO"]
+    cat("  Recoded obsolete Codogno CPI code\n")
+  } else {
+    cat("  No cpi_code column found, skipping\n")
+  }
+
+  cat("\n")
+  cat("=" %+% rep("=", 70) %+% "\n")
+  cat(sprintf("✓ ENRICHMENT COMPLETE: %s final spells for %s individuals\n",
+              format(nrow(dt), big.mark = ","),
+              format(dt[, data.table::uniqueN(cf)], big.mark = ",")))
+  cat("=" %+% rep("=", 70) %+% "\n\n")
+
+  return(dt)
+}
+
+
 # 2. Load and consolidate data (legacy) -----
 
 #' Load and consolidate employment data

@@ -29,7 +29,7 @@ tar_source("R/")
 # Set test_mode=TRUE for fast testing with sample data (10K CFs by default)
 # Set test_mode=FALSE for full production pipeline
 
-test_mode <- FALSE         # Toggle test mode (TRUE = use sample, FALSE = use full data)
+test_mode <- TRUE          # Toggle test mode (TRUE = use sample, FALSE = use full data)
 sample_size <- 10000      # Number of CFs to sample (only used if test_mode=TRUE)
 sample_seed <- 42         # Random seed for reproducible sampling
 
@@ -42,8 +42,9 @@ shared_data_dir <- ifelse(Sys.getenv("SHARED_DATA_DIR") == "",
                           "~/Documents/funzioni/shared_data",
                           Sys.getenv("SHARED_DATA_DIR"))
 
-# Define output directory
+# Define output directories
 output_dir <- "output/dashboard"
+output_dir_workplace <- "output/dashboard_workplace"
 
 # Define the pipeline
 list(
@@ -163,6 +164,7 @@ list(
   # ============================================================================
   # Apply vecshift → unemployment → DID/POL → longworkR → geo enrichment
   # This runs ONCE on the complete dataset, preserving both location columns
+  # Geographic inheritance for unemployment spells happens in filter_by_location()
 
   tar_target(
     name = data_consolidated,
@@ -193,8 +195,8 @@ list(
   # ============================================================================
   # PHASE 3: FORK - Filter Consolidated Data by Location
   # ============================================================================
-  # Simple filtering of the consolidated dataset by residence OR workplace
-  # This is lightweight - just subsetting rows based on location
+  # Filter with geographic inheritance for unemployment spells (Option A)
+  # Unemployment spells with NA location inherit from previous employment spell
 
   tar_target(
     name = data_residence,
@@ -206,7 +208,7 @@ list(
     format = "fst"  # FST preserves IDate type correctly
   ),
 
-  # Workplace branch: filtered but not processed yet
+  # Workplace branch
   tar_target(
     name = data_workplace,
     command = filter_by_location(
@@ -244,7 +246,7 @@ list(
     name = open_transitions,
     command = {
       data.table::setDT(data_residence)  # Ensure it's data.table after FST load
-      compute_open_transitions(data_residence, as.Date("2024-12-31"))
+      compute_open_transitions(data_residence, data.table::as.IDate("2024-12-31"))
     },
     format = "qs"
   ),
@@ -574,6 +576,275 @@ list(
   ),
 
   # ============================================================================
+  # WORKPLACE BRANCH: Full Transition Pipeline
+  # ============================================================================
+  # Process workplace-filtered data to create transition matrices for
+  # professions and sectors (people working in Lombardy)
+
+  # 1. Extract demographics -----
+  tar_target(
+    name = demographics_workplace,
+    command = {
+      data.table::setDT(data_workplace)
+      extract_demographics(data_workplace)
+    },
+    format = "qs"
+  ),
+
+  # 2. Compute transitions -----
+  tar_target(
+    name = closed_transitions_workplace,
+    command = {
+      data.table::setDT(data_workplace)
+      compute_closed_transitions(data_workplace)
+    },
+    format = "qs"
+  ),
+
+  tar_target(
+    name = open_transitions_workplace,
+    command = {
+      data.table::setDT(data_workplace)
+      compute_open_transitions(data_workplace, data.table::as.IDate("2024-12-31"))
+    },
+    format = "qs"
+  ),
+
+  tar_target(
+    name = unemployment_spells_workplace,
+    command = {
+      data.table::setDT(data_workplace)
+      data_workplace[arco == 0 & (!is.na(did_attribute) | !is.na(pol_attribute)), .(
+        cf,
+        unemp_start = inizio,
+        unemp_end = fine,
+        did_attribute,
+        did_match_quality,
+        pol_attribute,
+        pol_match_quality
+      )]
+    },
+    format = "qs"
+  ),
+
+  # 3. Combine and enrich transitions -----
+  tar_target(
+    name = transitions_combined_workplace,
+    command = rbindlist(list(closed_transitions_workplace, open_transitions_workplace), fill = TRUE),
+    format = "qs"
+  ),
+
+  tar_target(
+    name = transitions_with_did_pol_workplace,
+    command = add_did_pol_to_transitions(transitions_combined_workplace, unemployment_spells_workplace),
+    format = "qs"
+  ),
+
+  tar_target(
+    name = transitions_workplace,
+    command = merge(transitions_with_did_pol_workplace,
+                    demographics_workplace[, .(cf, sesso, cleta, istruzione)],
+                    by = "cf", all.x = TRUE),
+    format = "qs"
+  ),
+
+  # 4. Transition matrices (standard) -----
+  tar_target(
+    name = transition_matrices_workplace,
+    command = create_transition_matrices(transitions_workplace),
+    format = "qs"
+  ),
+
+  # 5. Transition matrices (45-day lag) -----
+  tar_target(
+    name = transitions_45day_workplace,
+    command = transitions_workplace[unemployment_duration > 45 | is.na(unemployment_duration)],
+    format = "qs"
+  ),
+
+  tar_target(
+    name = transition_matrices_45day_workplace,
+    command = create_transition_matrices(transitions_45day_workplace),
+    format = "qs"
+  ),
+
+  # 6. Enrich matrices with labels (standard) -----
+  tar_target(
+    name = profession_matrix_raw_workplace,
+    command = transition_matrices_workplace$profession,
+    format = "qs"
+  ),
+
+  tar_target(
+    name = sector_matrix_raw_workplace,
+    command = transition_matrices_workplace$sector,
+    format = "qs"
+  ),
+
+  tar_target(
+    name = profession_transitions_labeled_workplace,
+    command = enrich_transition_matrix_with_labels(
+      profession_matrix_raw_workplace,
+      classifiers$professioni,
+      code_col = "name",
+      label_col = "label"
+    ),
+    format = "qs"
+  ),
+
+  tar_target(
+    name = sector_transitions_labeled_workplace,
+    command = enrich_transition_matrix_with_labels(
+      sector_matrix_raw_workplace,
+      classifiers$settori,
+      code_col = "ateco",
+      label_col = "nome"
+    ),
+    format = "qs"
+  ),
+
+  tar_target(
+    name = profession_matrix_workplace,
+    command = convert_transitions_to_matrix(profession_transitions_labeled_workplace),
+    format = "qs"
+  ),
+
+  tar_target(
+    name = sector_matrix_workplace,
+    command = convert_transitions_to_matrix(sector_transitions_labeled_workplace),
+    format = "qs"
+  ),
+
+  # 7. Network plots and summary stats (standard) -----
+  tar_target(
+    name = profession_network_plot_workplace,
+    command = create_transition_network_plot(
+      profession_transitions_labeled_workplace,
+      title = "Profession Transition Network (Workplace-Based)",
+      top_n = 50,
+      min_transitions = 5
+    ),
+    format = "qs"
+  ),
+
+  tar_target(
+    name = sector_network_plot_workplace,
+    command = create_transition_network_plot(
+      sector_transitions_labeled_workplace,
+      title = "Economic Sector Transition Network (Workplace-Based)",
+      top_n = 50,
+      min_transitions = 5
+    ),
+    format = "qs"
+  ),
+
+  tar_target(
+    name = profession_summary_stats_workplace,
+    command = compute_transition_summary_stats(
+      profession_transitions_labeled_workplace,
+      top_k = 10
+    ),
+    format = "qs"
+  ),
+
+  tar_target(
+    name = sector_summary_stats_workplace,
+    command = compute_transition_summary_stats(
+      sector_transitions_labeled_workplace,
+      top_k = 10
+    ),
+    format = "qs"
+  ),
+
+  # 8. Enrich matrices with labels (45-day lag) -----
+  tar_target(
+    name = profession_matrix_raw_45day_workplace,
+    command = transition_matrices_45day_workplace$profession,
+    format = "qs"
+  ),
+
+  tar_target(
+    name = sector_matrix_raw_45day_workplace,
+    command = transition_matrices_45day_workplace$sector,
+    format = "qs"
+  ),
+
+  tar_target(
+    name = profession_transitions_labeled_45day_workplace,
+    command = enrich_transition_matrix_with_labels(
+      profession_matrix_raw_45day_workplace,
+      classifiers$professioni,
+      code_col = "name",
+      label_col = "label"
+    ),
+    format = "qs"
+  ),
+
+  tar_target(
+    name = sector_transitions_labeled_45day_workplace,
+    command = enrich_transition_matrix_with_labels(
+      sector_matrix_raw_45day_workplace,
+      classifiers$settori,
+      code_col = "ateco",
+      label_col = "nome"
+    ),
+    format = "qs"
+  ),
+
+  tar_target(
+    name = profession_matrix_45day_workplace,
+    command = convert_transitions_to_matrix(profession_transitions_labeled_45day_workplace),
+    format = "qs"
+  ),
+
+  tar_target(
+    name = sector_matrix_45day_workplace,
+    command = convert_transitions_to_matrix(sector_transitions_labeled_45day_workplace),
+    format = "qs"
+  ),
+
+  # 9. Network plots and summary stats (45-day lag) -----
+  tar_target(
+    name = profession_network_plot_45day_workplace,
+    command = create_transition_network_plot(
+      profession_transitions_labeled_45day_workplace,
+      title = "Profession Transition Network (Workplace, 45+ Day Gap)",
+      top_n = 50,
+      min_transitions = 5
+    ),
+    format = "qs"
+  ),
+
+  tar_target(
+    name = sector_network_plot_45day_workplace,
+    command = create_transition_network_plot(
+      sector_transitions_labeled_45day_workplace,
+      title = "Sector Transition Network (Workplace, 45+ Day Gap)",
+      top_n = 50,
+      min_transitions = 5
+    ),
+    format = "qs"
+  ),
+
+  tar_target(
+    name = profession_summary_stats_45day_workplace,
+    command = compute_transition_summary_stats(
+      profession_transitions_labeled_45day_workplace,
+      top_k = 10
+    ),
+    format = "qs"
+  ),
+
+  tar_target(
+    name = sector_summary_stats_45day_workplace,
+    command = compute_transition_summary_stats(
+      sector_transitions_labeled_45day_workplace,
+      top_k = 10
+    ),
+    format = "qs"
+  ),
+
+  # ============================================================================
   # PHASE 10: File Outputs
   # ============================================================================
   # Write final datasets to FST and RDS files for dashboard consumption
@@ -717,6 +988,117 @@ list(
   ),
 
   # ============================================================================
+  # WORKPLACE BRANCH: File Outputs
+  # ============================================================================
+  # Write workplace-based transition matrices and visualizations
+
+  # Write large transition dataset to FST
+  tar_target(
+    name = output_transitions_workplace,
+    command = {
+      dir.create(output_dir_workplace, recursive = TRUE, showWarnings = FALSE)
+      path <- file.path(output_dir_workplace, "transitions.fst")
+      write_fst(transitions_workplace, path, compress = 85)
+      path
+    },
+    format = "file"
+  ),
+
+  # Write smaller lookup and summary objects to RDS
+  tar_target(
+    name = output_rds_files_workplace,
+    command = {
+      # Ensure output directory exists
+      dir.create(output_dir_workplace, recursive = TRUE, showWarnings = FALSE)
+
+      # Save all RDS files
+      saveRDS(classifiers, file.path(output_dir_workplace, "classifiers.rds"))
+      saveRDS(transition_matrices_workplace, file.path(output_dir_workplace, "transition_matrices.rds"))
+
+      # Save profession and sector transition files (separate) - both formats
+      saveRDS(profession_transitions_labeled_workplace, file.path(output_dir_workplace, "profession_transitions.rds"))
+      saveRDS(sector_transitions_labeled_workplace, file.path(output_dir_workplace, "sector_transitions.rds"))
+      saveRDS(profession_matrix_workplace, file.path(output_dir_workplace, "profession_matrix.rds"))
+      saveRDS(sector_matrix_workplace, file.path(output_dir_workplace, "sector_matrix.rds"))
+
+      # Save profession and sector summary statistics
+      saveRDS(profession_summary_stats_workplace, file.path(output_dir_workplace, "profession_summary_stats.rds"))
+      saveRDS(sector_summary_stats_workplace, file.path(output_dir_workplace, "sector_summary_stats.rds"))
+
+      # Save 45-day lag transition matrices and statistics
+      saveRDS(transition_matrices_45day_workplace, file.path(output_dir_workplace, "transition_matrices_45day.rds"))
+      saveRDS(profession_transitions_labeled_45day_workplace, file.path(output_dir_workplace, "profession_transitions_45day.rds"))
+      saveRDS(sector_transitions_labeled_45day_workplace, file.path(output_dir_workplace, "sector_transitions_45day.rds"))
+      saveRDS(profession_matrix_45day_workplace, file.path(output_dir_workplace, "profession_matrix_45day.rds"))
+      saveRDS(sector_matrix_45day_workplace, file.path(output_dir_workplace, "sector_matrix_45day.rds"))
+      saveRDS(profession_summary_stats_45day_workplace, file.path(output_dir_workplace, "profession_summary_stats_45day.rds"))
+      saveRDS(sector_summary_stats_45day_workplace, file.path(output_dir_workplace, "sector_summary_stats_45day.rds"))
+
+      # Return indicator
+      "rds_files_saved_workplace"
+    },
+    format = "qs"
+  ),
+
+  # Write network visualization plots to PNG files
+  tar_target(
+    name = output_network_plots_workplace,
+    command = {
+      # Create plots subdirectory
+      plots_dir <- file.path(output_dir_workplace, "plots")
+      dir.create(plots_dir, recursive = TRUE, showWarnings = FALSE)
+
+      # Save profession network plot
+      prof_plot_path <- file.path(plots_dir, "profession_network.png")
+      ggplot2::ggsave(
+        filename = prof_plot_path,
+        plot = profession_network_plot_workplace,
+        width = 12,
+        height = 10,
+        dpi = 300,
+        bg = "white"
+      )
+
+      # Save sector network plot
+      sector_plot_path <- file.path(plots_dir, "sector_network.png")
+      ggplot2::ggsave(
+        filename = sector_plot_path,
+        plot = sector_network_plot_workplace,
+        width = 12,
+        height = 10,
+        dpi = 300,
+        bg = "white"
+      )
+
+      # Save 45-day lag profession network plot
+      prof_plot_path_45day <- file.path(plots_dir, "profession_network_45day.png")
+      ggplot2::ggsave(
+        filename = prof_plot_path_45day,
+        plot = profession_network_plot_45day_workplace,
+        width = 12,
+        height = 10,
+        dpi = 300,
+        bg = "white"
+      )
+
+      # Save 45-day lag sector network plot
+      sector_plot_path_45day <- file.path(plots_dir, "sector_network_45day.png")
+      ggplot2::ggsave(
+        filename = sector_plot_path_45day,
+        plot = sector_network_plot_45day_workplace,
+        width = 12,
+        height = 10,
+        dpi = 300,
+        bg = "white"
+      )
+
+      # Return vector of file paths for targets to track
+      c(prof_plot_path, sector_plot_path, prof_plot_path_45day, sector_plot_path_45day)
+    },
+    format = "file"
+  ),
+
+  # ============================================================================
   # PHASE 11: Validation and Summary Report
   # ============================================================================
   # Generate comprehensive validation report of pipeline execution
@@ -751,7 +1133,7 @@ list(
       cat("PHASE 3: Geographic Filtering\n")
       cat("------------------------------\n")
       cat("  Residence-filtered:", nrow(data_residence), "\n")
-      cat("  Workplace-filtered:", nrow(data_workplace), "(not processed)\n\n")
+      cat("  Workplace-filtered:", nrow(data_workplace), "\n\n")
 
       cat("PHASE 4+: Residence Branch Processing\n")
       cat("--------------------------------------\n")
@@ -768,26 +1150,55 @@ list(
           round(transitions[, mean(unemployment_duration, na.rm = TRUE)], 1),
           "days\n\n")
 
-      cat("Transition Matrices\n")
-      cat("-------------------\n")
+      cat("Transition Matrices (Residence)\n")
+      cat("--------------------------------\n")
       cat("  Matrix types created:", length(transition_matrices), "\n")
       cat("  45-day lag transitions:", nrow(transitions_45day), "\n\n")
 
-      cat("Career Analysis\n")
-      cat("---------------\n")
+      cat("Career Analysis (Residence)\n")
+      cat("---------------------------\n")
       cat("  Individuals with metrics:", nrow(career_metrics), "\n")
       cat("  Career clusters:", person_data[, uniqueN(cluster_label_it)], "\n\n")
 
-      cat("Output Files\n")
-      cat("------------\n")
+      cat("Output Files (Residence)\n")
+      cat("------------------------\n")
       cat("  Output directory:", output_dir, "\n")
       cat("  Transitions file:", file.exists(output_transitions), "\n")
       cat("  Person data file:", file.exists(output_person_data), "\n")
       cat("  Network plots: 4 PNG files generated\n\n")
 
+      # Workplace branch statistics
+      data.table::setDT(transitions_workplace)
+
+      cat("PHASE 4+: Workplace Branch Processing\n")
+      cat("--------------------------------------\n")
+      cat("  Total transitions:", nrow(transitions_workplace), "\n")
+      cat("  Closed transitions (emp→emp):",
+          transitions_workplace[, sum(is_closed, na.rm = TRUE)], "\n")
+      cat("  Open transitions (emp→unemp):",
+          transitions_workplace[, sum(is_open, na.rm = TRUE)], "\n")
+      cat("  With DID support:",
+          transitions_workplace[, sum(has_did, na.rm = TRUE)], "\n")
+      cat("  With POL support:",
+          transitions_workplace[, sum(has_pol, na.rm = TRUE)], "\n")
+      cat("  Average unemployment duration:",
+          round(transitions_workplace[, mean(unemployment_duration, na.rm = TRUE)], 1),
+          "days\n\n")
+
+      cat("Transition Matrices (Workplace)\n")
+      cat("--------------------------------\n")
+      cat("  Matrix types created:", length(transition_matrices_workplace), "\n")
+      cat("  45-day lag transitions:", nrow(transitions_45day_workplace), "\n\n")
+
+      cat("Output Files (Workplace)\n")
+      cat("------------------------\n")
+      cat("  Output directory:", output_dir_workplace, "\n")
+      cat("  Transitions file:", file.exists(output_transitions_workplace), "\n")
+      cat("  Network plots: 4 PNG files generated\n\n")
+
       cat("==========================================================\n")
       cat("  ✓ Pipeline completed successfully!\n")
-      cat("  ✓ Workplace branch filtered but not processed (ready)\n")
+      cat("  ✓ Both residence and workplace branches processed\n")
       cat("==========================================================\n\n")
 
       # Return summary
@@ -800,23 +1211,10 @@ list(
           n_consolidated = nrow(data_consolidated_clean),
           n_residence = nrow(data_residence),
           n_workplace = nrow(data_workplace),
-          n_transitions = nrow(transitions)
+          n_transitions_residence = nrow(transitions),
+          n_transitions_workplace = nrow(transitions_workplace)
         )
       )
     }
   )
-
-  # ============================================================================
-  # WORKPLACE BRANCH: Infrastructure ready, not activated
-  # ============================================================================
-  # To activate workplace branch, uncomment the targets below and duplicate
-  # Phase 4-12 targets with "_workplace" suffix, pointing to data_workplace
-
-  # Example (commented out):
-  # tar_target(
-  #   name = demographics_workplace,
-  #   command = extract_demographics(data_workplace),
-  #   format = "qs"
-  # ),
-  # ... (continue with all other targets)
 )

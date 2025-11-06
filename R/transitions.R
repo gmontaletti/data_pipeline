@@ -247,7 +247,7 @@ compute_closed_transitions <- function(dt) {
 #' }
 #'
 #' @export
-compute_open_transitions <- function(dt, observation_end = as.Date("2024-10-20")) {
+compute_open_transitions <- function(dt, observation_end = data.table::as.IDate("2024-10-20")) {
 
   if (!data.table::is.data.table(dt)) {
     stop("Input must be a data.table")

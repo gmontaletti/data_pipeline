@@ -392,6 +392,15 @@ add_cpi_via_belfiore <- function(dt, belfiore_col = "COMUNE_LAVORATORE", add_nam
     sort = FALSE
   )
 
+  # Data quality fix: Torre de' Busi (L257 → 016215) is missing from comune_cpi_lookup.rds
+  # This comune in Bergamo province should map to CPI PONTE SAN PIETRO
+  if (sum(dt$pro_com_t == "016215" & is.na(dt$cpi_code), na.rm = TRUE) > 0) {
+    dt[pro_com_t == "016215" & is.na(cpi_code), `:=`(
+      cpi_code = "G856C000065",
+      cpi_name = "CPI PONTE SAN PIETRO"
+    )]
+  }
+
   # Report ISTAT → CPI matching
   n_matched_cpi <- sum(!is.na(dt$cpi_code))
   match_pct_cpi <- round(100 * n_matched_cpi / n_total, 1)

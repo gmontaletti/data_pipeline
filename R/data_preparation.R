@@ -164,6 +164,36 @@ filter_by_location <- function(dt, filter_by = c("residence", "workplace"), terr
 
   n_before <- nrow(dt)
 
+  # CRITICAL FIX: Inherit geography for spells with NA location
+  # Any spell with NA geography inherits from previous spell (typically unemployment spells)
+  dt <- data.table::copy(dt)  # Avoid modifying by reference
+  data.table::setorder(dt, cf, inizio)
+
+  # Use standard R functions to avoid NSE issues
+  n_na_before <- sum(is.na(dt[[location_col]]))
+
+  if (n_na_before > 0) {
+    # Create a vector of previous locations per person
+    prev_vals <- rep(NA_character_, nrow(dt))
+
+    # For each person, shift their location values by 1
+    for (person in unique(dt$cf)) {
+      rows <- which(dt$cf == person)
+      vals <- dt[[location_col]][rows]
+      prev_vals[rows] <- c(NA, vals[-length(vals)])
+    }
+
+    # Fill NA locations with previous location
+    na_mask <- is.na(dt[[location_col]])
+    dt[[location_col]][na_mask] <- prev_vals[na_mask]
+
+    n_na_after <- sum(is.na(dt[[location_col]]))
+
+    cat(sprintf("  Inherited geography for %s spells (%s still have NA)\n",
+                format(n_na_before - n_na_after, big.mark = ","),
+                format(n_na_after, big.mark = ",")))
+  }
+
   # Merge with Lombardia comuni to filter
   lombardia_comuni <- unique(territoriale[DES_REGIONE_PAUT == "LOMBARDIA",
                                           .(COD_COMUNE, DES_PROVINCIA)])

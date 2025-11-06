@@ -309,12 +309,20 @@ data_with_geo[cpi_code == "OLD_CODE", cpi_code := "NEW_CODE"]
 - **Memory**: Pipeline requires ~8-16GB RAM for full execution
 - **Runtime**: Full pipeline takes 30-60 minutes depending on data size
 
+## Version
+
+**Current Version**: 0.2.1 (2025-11-06)
+
+- v0.2.1: Bug fixes for Date/IDate type handling and DID/POL matching
+- v0.2.0: Dual-branch architecture (residence/workplace)
+- v0.1.0: Initial release
+
 ## Citation
 
 If you use this pipeline in your research, please cite:
 
 ```
-Montaletti, G. (2025). Labor Market Transition Analysis Pipeline.
+Montaletti, G. (2025). Labor Market Transition Analysis Pipeline (v0.2.1).
 GitHub: https://github.com/gmontaletti/data_pipeline
 ORCID: 0009-0002-5327-1122
 ```
