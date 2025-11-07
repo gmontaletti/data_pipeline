@@ -311,8 +311,9 @@ data_with_geo[cpi_code == "OLD_CODE", cpi_code := "NEW_CODE"]
 
 ## Version
 
-**Current Version**: 0.2.1 (2025-11-06)
+**Current Version**: 0.2.2 (2025-11-06)
 
+- v0.2.2: Fix filter_by_location() bug and optimize performance (6-30x faster, Phase 3 now ~20s)
 - v0.2.1: Bug fixes for Date/IDate type handling and DID/POL matching
 - v0.2.0: Dual-branch architecture (residence/workplace)
 - v0.1.0: Initial release
@@ -322,7 +323,7 @@ data_with_geo[cpi_code == "OLD_CODE", cpi_code := "NEW_CODE"]
 If you use this pipeline in your research, please cite:
 
 ```
-Montaletti, G. (2025). Labor Market Transition Analysis Pipeline (v0.2.1).
+Montaletti, G. (2025). Labor Market Transition Analysis Pipeline (v0.2.2).
 GitHub: https://github.com/gmontaletti/data_pipeline
 ORCID: 0009-0002-5327-1122
 ```

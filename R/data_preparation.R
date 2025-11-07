@@ -164,28 +164,30 @@ filter_by_location <- function(dt, filter_by = c("residence", "workplace"), terr
 
   n_before <- nrow(dt)
 
-  # CRITICAL FIX: Inherit geography for spells with NA location
-  # Any spell with NA geography inherits from previous spell (typically unemployment spells)
-  dt <- data.table::copy(dt)  # Avoid modifying by reference
+  # OPTIMIZATION 1: Work directly on dt (no copy needed - filtering creates new object)
+  # Ensure proper sorting for shift() operation
   data.table::setorder(dt, cf, inizio)
 
-  # Use standard R functions to avoid NSE issues
+  # OPTIMIZATION 2: Use data.table's vectorized shift() for geographic inheritance
+  # This replaces the split() + for-loop approach with C-level optimized code
   n_na_before <- sum(is.na(dt[[location_col]]))
 
   if (n_na_before > 0) {
-    # Create a vector of previous locations per person
-    prev_vals <- rep(NA_character_, nrow(dt))
+    cat(sprintf("  Inheriting geography for %s NA spells...\n",
+                format(n_na_before, big.mark = ",")))
 
-    # For each person, shift their location values by 1
-    for (person in unique(dt$cf)) {
-      rows <- which(dt$cf == person)
-      vals <- dt[[location_col]][rows]
-      prev_vals[rows] <- c(NA, vals[-length(vals)])
-    }
+    # SOLUTION: Use collapse::flag() which respects grouping differently than data.table::shift()
+    # collapse package is already loaded (dependency of vecshift)
+    # flag() performs grouped lagging without the problematic 'by' parameter syntax
+
+    # Get lagged values using collapse::flag (groups by cf, respects sort order)
+    prev_vals <- collapse::flag(dt[[location_col]], n = 1, g = dt$cf, t = dt$inizio)
 
     # Fill NA locations with previous location
     na_mask <- is.na(dt[[location_col]])
-    dt[[location_col]][na_mask] <- prev_vals[na_mask]
+    if (sum(na_mask) > 0) {
+      data.table::set(dt, i = which(na_mask), j = location_col, value = prev_vals[na_mask])
+    }
 
     n_na_after <- sum(is.na(dt[[location_col]]))
 
@@ -194,15 +196,20 @@ filter_by_location <- function(dt, filter_by = c("residence", "workplace"), terr
                 format(n_na_after, big.mark = ",")))
   }
 
-  # Merge with Lombardia comuni to filter
-  lombardia_comuni <- unique(territoriale[DES_REGIONE_PAUT == "LOMBARDIA",
-                                          .(COD_COMUNE, DES_PROVINCIA)])
+  # OPTIMIZATION 3: Filter to Lombardia and add provincia in one merge operation
+  # Extract Lombardia comuni with their provincia
+  lombardia_lookup <- unique(territoriale[DES_REGIONE_PAUT == "LOMBARDIA",
+                                          list(COD_COMUNE, DES_PROVINCIA)])
 
-  dt <- merge(dt, lombardia_comuni,
+  # Merge to filter AND add provincia (single operation, keeps only matching records)
+  dt <- merge(dt, lombardia_lookup,
               by.x = location_col,
               by.y = "COD_COMUNE",
-              all.x = FALSE)  # Keep only matching records
-  data.table::setDT(dt)  # Ensure dt is data.table after merge
+              all.x = FALSE,  # Keep only Lombardia records
+              all.y = FALSE)
+
+  # Ensure result is data.table (merge can sometimes return data.frame)
+  data.table::setDT(dt)
 
   n_after <- nrow(dt)
   pct_retained <- 100 * n_after / n_before
@@ -212,6 +219,13 @@ filter_by_location <- function(dt, filter_by = c("residence", "workplace"), terr
               format(n_before, big.mark = ","),
               format(n_after, big.mark = ","),
               pct_retained))
+
+  # OPTIMIZATION 5: Set key for downstream performance (if columns exist)
+  key_cols <- c("cf", "inizio", "fine")
+  existing_cols <- key_cols[key_cols %in% names(dt)]
+  if (length(existing_cols) > 0) {
+    data.table::setkeyv(dt, existing_cols)
+  }
 
   return(dt)
 }
