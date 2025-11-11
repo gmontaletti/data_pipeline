@@ -29,7 +29,7 @@ tar_source("R/")
 # Set test_mode=TRUE for fast testing with sample data (10K CFs by default)
 # Set test_mode=FALSE for full production pipeline
 
-test_mode <- TRUE          # Toggle test mode (TRUE = use sample, FALSE = use full data)
+test_mode <- FALSE          # Toggle test mode (TRUE = use sample, FALSE = use full data)
 sample_size <- 10000      # Number of CFs to sample (only used if test_mode=TRUE)
 sample_seed <- 42         # Random seed for reproducible sampling
 
@@ -844,6 +844,315 @@ list(
     format = "qs"
   ),
 
+  # 9. MONECA Labor Market Segmentation -----
+
+  # 9.0 Cutoff Analysis (Pre-compute optimal cutoffs) -----
+  tar_target(
+    name = optimal_cutoff_standard,
+    command = {
+      cat("\n")
+      cat(rep("=", 70), "\n", sep = "")
+      cat("CUTOFF ANALYSIS: Standard Matrix\n")
+      cat(rep("=", 70), "\n\n", sep = "")
+
+      # Prepare matrix: add margins for MONECA
+      mx_with_margins <- prepare_matrix_for_moneca(sector_matrix_workplace)
+
+      cat("Matrix dimensions:", nrow(mx_with_margins), "x", ncol(mx_with_margins), "\n\n")
+
+      # Find optimal cutoff using moneca's find_optimal_cutoff
+      # Note: Explicit cutoff_range needed due to extreme RR values in real data
+      cutoff_result <- moneca::find_optimal_cutoff(
+        mx = mx_with_margins,
+        criterion = "elbow",
+        cutoff_range = seq(1.5, 8, by = 0.25),
+        n_bootstrap = 30,
+        verbose = TRUE
+      )
+
+      optimal_cutoff <- cutoff_result$optimal_cutoff
+
+      cat("\nOptimal cutoff:", optimal_cutoff, "\n")
+      cat(rep("=", 70), "\n\n", sep = "")
+
+      optimal_cutoff
+    },
+    format = "qs"
+  ),
+
+  tar_target(
+    name = optimal_cutoff_45day,
+    command = {
+      cat("\n")
+      cat(rep("=", 70), "\n", sep = "")
+      cat("CUTOFF ANALYSIS: 45-Day Lag Matrix\n")
+      cat(rep("=", 70), "\n\n", sep = "")
+
+      # Prepare matrix: add margins for MONECA
+      mx_with_margins <- prepare_matrix_for_moneca(sector_matrix_45day_workplace)
+
+      cat("Matrix dimensions:", nrow(mx_with_margins), "x", ncol(mx_with_margins), "\n\n")
+
+      # Find optimal cutoff using moneca's find_optimal_cutoff
+      # Note: Explicit cutoff_range needed due to extreme RR values in real data
+      cutoff_result <- moneca::find_optimal_cutoff(
+        mx = mx_with_margins,
+        criterion = "elbow",
+        cutoff_range = seq(1.5, 8, by = 0.25),
+        n_bootstrap = 30,
+        verbose = TRUE
+      )
+
+      optimal_cutoff <- cutoff_result$optimal_cutoff
+
+      cat("\nOptimal cutoff:", optimal_cutoff, "\n")
+      cat(rep("=", 70), "\n\n", sep = "")
+
+      optimal_cutoff
+    },
+    format = "qs"
+  ),
+
+  # 9.1 Standard Matrix Segmentation -----
+  tar_target(
+    name = moneca_standard,
+    command = {
+      # Prepare matrix with margins (required by moneca_fast)
+      mx_with_margins <- prepare_matrix_for_moneca(sector_matrix_workplace)
+
+      # Run clustering with optimal cutoff
+      cluster_labor_market(
+        mobility_matrix = mx_with_margins,
+        cut_off = optimal_cutoff_standard,
+        segment_levels = 2,
+        verbose = TRUE
+      )
+    },
+    format = "qs"
+  ),
+
+  tar_target(
+    name = segment_membership_standard,
+    command = moneca_standard$membership,
+    format = "qs"
+  ),
+
+  tar_target(
+    name = segment_composition_standard,
+    command = analyze_segment_composition(
+      moneca_standard$membership,
+      mobility_matrix = sector_matrix_workplace,
+      transitions_data = transitions_workplace,
+      classifiers = classifiers
+    ),
+    format = "qs"
+  ),
+
+  tar_target(
+    name = segment_naming_template_standard,
+    command = generate_naming_template(
+      segment_composition_standard,
+      output_path = "reference/data_pipeline/segment_names_standard.R",
+      analysis_type = "Standard transitions"
+    ),
+    format = "file"
+  ),
+
+  # 9.2 45-Day Lag Matrix Segmentation -----
+  tar_target(
+    name = moneca_45day,
+    command = {
+      # Prepare matrix with margins (required by moneca_fast)
+      mx_with_margins <- prepare_matrix_for_moneca(sector_matrix_45day_workplace)
+
+      # Run clustering with optimal cutoff
+      cluster_labor_market(
+        mobility_matrix = mx_with_margins,
+        cut_off = optimal_cutoff_45day,
+        segment_levels = 2,
+        verbose = TRUE
+      )
+    },
+    format = "qs"
+  ),
+
+  tar_target(
+    name = segment_membership_45day,
+    command = moneca_45day$membership,
+    format = "qs"
+  ),
+
+  tar_target(
+    name = segment_composition_45day,
+    command = analyze_segment_composition(
+      moneca_45day$membership,
+      mobility_matrix = sector_matrix_45day_workplace,
+      transitions_data = transitions_workplace,
+      classifiers = classifiers
+    ),
+    format = "qs"
+  ),
+
+  tar_target(
+    name = segment_naming_template_45day,
+    command = generate_naming_template(
+      segment_composition_45day,
+      output_path = "reference/data_pipeline/segment_names_45day.R",
+      analysis_type = "45-day lag transitions"
+    ),
+    format = "file"
+  ),
+
+  # 9.3 Segment-Based Specialization (Conditional) -----
+  # These targets only execute if naming templates are complete
+
+  tar_target(
+    name = segment_membership_named_standard,
+    command = {
+      template_path <- "reference/data_pipeline/segment_names_standard.R"
+      if (is_template_complete(template_path)) {
+        apply_segment_names(template_path, segment_membership_standard)
+      } else {
+        cat("⏸ Segment naming template (standard) not complete. Skipping.\n")
+        NULL
+      }
+    },
+    format = "qs"
+  ),
+
+  tar_target(
+    name = segment_membership_named_45day,
+    command = {
+      template_path <- "reference/data_pipeline/segment_names_45day.R"
+      if (is_template_complete(template_path)) {
+        apply_segment_names(template_path, segment_membership_45day)
+      } else {
+        cat("⏸ Segment naming template (45-day) not complete. Skipping.\n")
+        NULL
+      }
+    },
+    format = "qs"
+  ),
+
+  tar_target(
+    name = coverage_with_segments_standard,
+    command = {
+      if (!is.null(segment_membership_named_standard)) {
+        # Join annual coverage with segment membership
+        coverage_dt <- data.table::copy(annual_coverage_workplace)
+
+        # Add ateco_3digit column (assumed to be named 'ateco' in coverage)
+        segment_lookup <- segment_membership_named_standard[, .(sector, segment_id, segment_name)]
+        data.table::setnames(segment_lookup, "sector", "ateco")
+
+        # Merge
+        coverage_with_seg <- merge(coverage_dt, segment_lookup, by = "ateco", all.x = TRUE)
+
+        # Aggregate by year, comune, segment
+        coverage_by_segment <- coverage_with_seg[!is.na(segment_name), .(
+          total_coverage = sum(total_coverage),
+          n_contracts = sum(n_contracts),
+          n_workers = sum(n_workers),
+          mean_coverage = mean(mean_coverage),
+          median_coverage = median(median_coverage)
+        ), by = .(year, COMUNE_SEDE_LAVORO, segment_id, segment_name)]
+
+        # Calculate Balassa index by segment
+        calculate_balassa_index_by_segment(coverage_by_segment, segment_col = "segment_name")
+      } else {
+        cat("⏸ Skipping coverage_with_segments_standard (template not ready)\n")
+        NULL
+      }
+    },
+    format = "qs"
+  ),
+
+  tar_target(
+    name = coverage_with_segments_45day,
+    command = {
+      if (!is.null(segment_membership_named_45day)) {
+        # Join annual coverage with segment membership
+        coverage_dt <- data.table::copy(annual_coverage_workplace)
+
+        # Add segment info
+        segment_lookup <- segment_membership_named_45day[, .(sector, segment_id, segment_name)]
+        data.table::setnames(segment_lookup, "sector", "ateco")
+
+        # Merge
+        coverage_with_seg <- merge(coverage_dt, segment_lookup, by = "ateco", all.x = TRUE)
+
+        # Aggregate by year, comune, segment
+        coverage_by_segment <- coverage_with_seg[!is.na(segment_name), .(
+          total_coverage = sum(total_coverage),
+          n_contracts = sum(n_contracts),
+          n_workers = sum(n_workers),
+          mean_coverage = mean(mean_coverage),
+          median_coverage = median(median_coverage)
+        ), by = .(year, COMUNE_SEDE_LAVORO, segment_id, segment_name)]
+
+        # Calculate Balassa index by segment
+        calculate_balassa_index_by_segment(coverage_by_segment, segment_col = "segment_name")
+      } else {
+        cat("⏸ Skipping coverage_with_segments_45day (template not ready)\n")
+        NULL
+      }
+    },
+    format = "qs"
+  ),
+
+  tar_target(
+    name = comuni_specialization_segments_standard_2024,
+    command = {
+      if (!is.null(coverage_with_segments_standard)) {
+        create_specialization_sf_segments(
+          coverage_with_segments_standard,
+          year_filter = 2024,
+          segment_col = "segment_name",
+          classifiers = classifiers,
+          crs_output = "EPSG:4326"
+        )
+      } else {
+        cat("⏸ Skipping comuni_specialization_segments_standard_2024\n")
+        NULL
+      }
+    },
+    format = "qs"
+  ),
+
+  tar_target(
+    name = comuni_specialization_segments_45day_2024,
+    command = {
+      if (!is.null(coverage_with_segments_45day)) {
+        create_specialization_sf_segments(
+          coverage_with_segments_45day,
+          year_filter = 2024,
+          segment_col = "segment_name",
+          classifiers = classifiers,
+          crs_output = "EPSG:4326"
+        )
+      } else {
+        cat("⏸ Skipping comuni_specialization_segments_45day_2024\n")
+        NULL
+      }
+    },
+    format = "qs"
+  ),
+
+  # 10. Annual coverage estimation (workplace) -----
+  tar_target(
+    name = annual_coverage_workplace,
+    command = {
+      data.table::setDT(data_workplace)
+
+      # Filter to employment spells only (exclude unemployment)
+      employment_data <- data_workplace[data_workplace$arco != 0]
+
+      # Calculate annual coverage by year, comune, and sector
+      estimate_annual_coverage(employment_data)
+    },
+    format = "qs"
+  ),
+
   # ============================================================================
   # PHASE 10: File Outputs
   # ============================================================================
@@ -1004,6 +1313,18 @@ list(
     format = "file"
   ),
 
+  # Write annual coverage analysis to FST
+  tar_target(
+    name = output_annual_coverage_workplace,
+    command = {
+      dir.create(output_dir_workplace, recursive = TRUE, showWarnings = FALSE)
+      path <- file.path(output_dir_workplace, "annual_coverage_by_year_comune_sector.fst")
+      write_fst(annual_coverage_workplace, path, compress = 85)
+      path
+    },
+    format = "file"
+  ),
+
   # Write smaller lookup and summary objects to RDS
   tar_target(
     name = output_rds_files_workplace,
@@ -1096,6 +1417,65 @@ list(
       c(prof_plot_path, sector_plot_path, prof_plot_path_45day, sector_plot_path_45day)
     },
     format = "file"
+  ),
+
+  # Write MONECA segmentation outputs
+  tar_target(
+    name = output_moneca_segmentation,
+    command = {
+      dir.create(output_dir_workplace, recursive = TRUE, showWarnings = FALSE)
+
+      # Save cutoff analysis results
+      saveRDS(optimal_cutoff_standard, file.path(output_dir_workplace, "optimal_cutoff_standard.rds"))
+      saveRDS(optimal_cutoff_45day, file.path(output_dir_workplace, "optimal_cutoff_45day.rds"))
+
+      # Save MONECA clustering objects
+      saveRDS(moneca_standard, file.path(output_dir_workplace, "moneca_standard.rds"))
+      saveRDS(moneca_45day, file.path(output_dir_workplace, "moneca_45day.rds"))
+
+      # Save segment memberships
+      saveRDS(segment_membership_standard, file.path(output_dir_workplace, "segment_membership_standard.rds"))
+      saveRDS(segment_membership_45day, file.path(output_dir_workplace, "segment_membership_45day.rds"))
+
+      # Save segment composition analysis
+      saveRDS(segment_composition_standard, file.path(output_dir_workplace, "segment_composition_standard.rds"))
+      saveRDS(segment_composition_45day, file.path(output_dir_workplace, "segment_composition_45day.rds"))
+
+      # Save named memberships if available
+      if (!is.null(segment_membership_named_standard)) {
+        saveRDS(segment_membership_named_standard,
+                file.path(output_dir_workplace, "segment_membership_named_standard.rds"))
+      }
+      if (!is.null(segment_membership_named_45day)) {
+        saveRDS(segment_membership_named_45day,
+                file.path(output_dir_workplace, "segment_membership_named_45day.rds"))
+      }
+
+      # Save segment-based specialization data if available
+      if (!is.null(coverage_with_segments_standard)) {
+        write_fst(coverage_with_segments_standard,
+                 file.path(output_dir_workplace, "coverage_with_segments_standard.fst"),
+                 compress = 85)
+      }
+      if (!is.null(coverage_with_segments_45day)) {
+        write_fst(coverage_with_segments_45day,
+                 file.path(output_dir_workplace, "coverage_with_segments_45day.fst"),
+                 compress = 85)
+      }
+
+      # Save spatial dataframes if available
+      if (!is.null(comuni_specialization_segments_standard_2024)) {
+        saveRDS(comuni_specialization_segments_standard_2024,
+                file.path(output_dir_workplace, "comuni_specialization_segments_standard_2024.rds"))
+      }
+      if (!is.null(comuni_specialization_segments_45day_2024)) {
+        saveRDS(comuni_specialization_segments_45day_2024,
+                file.path(output_dir_workplace, "comuni_specialization_segments_45day_2024.rds"))
+      }
+
+      "moneca_outputs_saved"
+    },
+    format = "qs"
   ),
 
   # ============================================================================
