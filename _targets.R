@@ -16,7 +16,7 @@ library(tarchetypes)
 
 # Set target options
 tar_option_set(
-  packages = c("data.table", "fst", "devtools"),
+  packages = c("data.table", "fst", "devtools", "DBI", "RPostgres"),
   format = "qs"  # Default format for faster serialization
 )
 
@@ -32,6 +32,15 @@ tar_source("R/")
 test_mode <- FALSE          # Toggle test mode (TRUE = use sample, FALSE = use full data)
 sample_size <- 10000      # Number of CFs to sample (only used if test_mode=TRUE)
 sample_seed <- 42         # Random seed for reproducible sampling
+
+# ============================================================================
+# CONFIGURATION - Data Source Settings
+# ============================================================================
+# Set data_source="auto" to prefer database when available, fallback to FST
+# Set data_source="database" to require database connection (fails if unavailable)
+# Set data_source="fst" to use only FST files (ignores database even if available)
+
+data_source <- "auto"  # Options: "auto", "database", "fst"
 
 # Load development packages
 devtools::load_all("/Users/giampaolomontaletti/Documents/funzioni/longworkR/")
@@ -119,10 +128,32 @@ list(
   # ============================================================================
   # Load truly raw data files before any processing
   # Uses test_mode to switch between full data and sample data
+  # Uses data_source to select database vs FST file loading
+
+  # Database status check (for auto-detection)
+  tar_target(
+    name = db_status,
+    command = {
+      available <- db_available()
+      cat(sprintf("Database connection: %s\n",
+                  if(available) "AVAILABLE" else "NOT CONFIGURED"))
+      cat(sprintf("Data source setting: %s\n", data_source))
+      list(available = available, source = data_source)
+    },
+    format = "qs"
+  ),
 
   tar_target(
     name = raw_contracts,
-    command = load_raw_contracts(test_mode = test_mode),
+    command = {
+      # Determine actual source based on db_status and data_source config
+      source_to_use <- if (db_status$available && data_source != "fst") {
+        "database"
+      } else {
+        "fst"
+      }
+      load_raw_contracts(test_mode = test_mode, source = source_to_use)
+    },
     format = "fst"  # FST preserves IDate type correctly
   ),
 
@@ -160,63 +191,206 @@ list(
   ),
 
   # ============================================================================
-  # PHASE 2: Consolidate FULL Dataset (BEFORE FILTERING)
+  # PHASE 2: Consolidate Dataset with Early Geographic Fork
   # ============================================================================
-  # Apply vecshift → unemployment → DID/POL → longworkR → geo enrichment
-  # This runs ONCE on the complete dataset, preserving both location columns
-  # Geographic inheritance for unemployment spells happens in filter_by_location()
+  # Step 1: Single vecshift consolidation on full Lombardia-connected data
+  # Step 2: Fork by geography BEFORE adding unemployment (avoids 1.5B vector explosion)
+  # Steps 3-5: Parallel consolidation chains for residence and workplace branches
+
+  # Step 1: Vecshift consolidation (overlaps) - SHARED
+  tar_target(
+    name = data_vecshift,
+    command = apply_vecshift_only(
+      contracts_prepared_unfiltered,
+      min_date = as.IDate("2021-01-01")
+    ),
+    format = "fst"
+  ),
+
+  # ============================================================================
+  # PHASE 2.1: FORK BY GEOGRAPHY (after vecshift, before unemployment)
+  # ============================================================================
+  # Split here to avoid geographic inheritance on millions of NA unemployment spells
+  # Employment spells from vecshift all have location data - simple filter
 
   tar_target(
-    name = data_consolidated,
-    command = consolidate_and_enrich(
-      contracts_prepared_unfiltered,
+    name = data_vecshift_residence,
+    command = filter_vecshift_by_geography(
+      data_vecshift,
+      filter_by = "residence",
+      territoriale = classifiers$territoriale,
+      contracts_prepared_unfiltered = contracts_prepared_unfiltered
+    ),
+    format = "fst"
+  ),
+
+  tar_target(
+    name = data_vecshift_workplace,
+    command = filter_vecshift_by_geography(
+      data_vecshift,
+      filter_by = "workplace",
+      territoriale = classifiers$territoriale,
+      contracts_prepared_unfiltered = contracts_prepared_unfiltered
+    ),
+    format = "fst"
+  ),
+
+  # ============================================================================
+  # PHASE 2.2: RESIDENCE BRANCH - Consolidation Pipeline
+  # ============================================================================
+
+  # Step 2R: Add unemployment periods (residence branch)
+  tar_target(
+    name = data_with_unemployment_residence,
+    command = add_unemployment_only(
+      data_vecshift_residence,
+      min_date = as.IDate("2021-01-01"),
+      max_date = as.IDate("2024-12-31")
+    ),
+    format = "fst"
+  ),
+
+  # Step 3R: Merge original contract attributes (residence branch)
+  tar_target(
+    name = data_with_attributes_residence,
+    command = merge_attributes_only(
+      data_with_unemployment_residence,
+      contracts_prepared_unfiltered
+    ),
+    format = "fst"
+  ),
+
+  # Step 4R: Match DID/POL events (residence branch)
+  tar_target(
+    name = data_with_did_pol_residence,
+    command = match_did_pol_memory_safe(
+      data_with_attributes_residence,
       raw_did,
       raw_pol,
       min_date = as.IDate("2021-01-01"),
       max_date = as.IDate("2024-12-31")
     ),
-    format = "fst"  # FST preserves IDate type correctly
+    format = "fst"
   ),
 
-  # Recode obsolete CPI codes
+  # Step 5R: Final consolidation (residence branch)
   tar_target(
-    name = data_consolidated_clean,
+    name = data_consolidated_residence,
+    command = consolidate_and_enrich_final(
+      data_with_did_pol_residence,
+      variable_handling = "first"
+    ),
+    format = "fst"
+  ),
+
+  # Recode obsolete CPI codes (residence branch)
+  tar_target(
+    name = data_consolidated_clean_residence,
     command = {
-      data.table::setDT(data_consolidated)  # Ensure it's data.table after FST load
-      # Recode obsolete Codogno CPI code to current code
-      data_consolidated[cpi_code == "C816C530490", cpi_code := "C816C000692"]
-      data_consolidated[cpi_code == "C816C000692",
+      data.table::setDT(data_consolidated_residence)
+      data_consolidated_residence[cpi_code == "C816C530490", cpi_code := "C816C000692"]
+      data_consolidated_residence[cpi_code == "C816C000692",
                        cpi_name := "CPI DELLA PROVINCIA DI LODI - UFFICIO PERIFERICO CODOGNO"]
-      data_consolidated
+      data_consolidated_residence
     },
-    format = "fst"  # FST preserves IDate type correctly
+    format = "fst"
   ),
 
   # ============================================================================
-  # PHASE 3: FORK - Filter Consolidated Data by Location
+  # PHASE 2.3: WORKPLACE BRANCH - Consolidation Pipeline
   # ============================================================================
-  # Filter with geographic inheritance for unemployment spells (Option A)
-  # Unemployment spells with NA location inherit from previous employment spell
+
+  # Step 2W: Add unemployment periods (workplace branch)
+  tar_target(
+    name = data_with_unemployment_workplace,
+    command = add_unemployment_only(
+      data_vecshift_workplace,
+      min_date = as.IDate("2021-01-01"),
+      max_date = as.IDate("2024-12-31")
+    ),
+    format = "fst"
+  ),
+
+  # Step 3W: Merge original contract attributes (workplace branch)
+  tar_target(
+    name = data_with_attributes_workplace,
+    command = merge_attributes_only(
+      data_with_unemployment_workplace,
+      contracts_prepared_unfiltered
+    ),
+    format = "fst"
+  ),
+
+  # Step 4W: Match DID/POL events (workplace branch)
+  tar_target(
+    name = data_with_did_pol_workplace,
+    command = match_did_pol_memory_safe(
+      data_with_attributes_workplace,
+      raw_did,
+      raw_pol,
+      min_date = as.IDate("2021-01-01"),
+      max_date = as.IDate("2024-12-31")
+    ),
+    format = "fst"
+  ),
+
+  # Step 5W: Final consolidation (workplace branch)
+  tar_target(
+    name = data_consolidated_workplace,
+    command = consolidate_and_enrich_final(
+      data_with_did_pol_workplace,
+      variable_handling = "first"
+    ),
+    format = "fst"
+  ),
+
+  # Recode obsolete CPI codes (workplace branch)
+  tar_target(
+    name = data_consolidated_clean_workplace,
+    command = {
+      data.table::setDT(data_consolidated_workplace)
+      data_consolidated_workplace[cpi_code == "C816C530490", cpi_code := "C816C000692"]
+      data_consolidated_workplace[cpi_code == "C816C000692",
+                       cpi_name := "CPI DELLA PROVINCIA DI LODI - UFFICIO PERIFERICO CODOGNO"]
+      data_consolidated_workplace
+    },
+    format = "fst"
+  ),
+
+  # ============================================================================
+  # PHASE 3: Branch Outputs (direct references, no filter_by_location needed)
+  # ============================================================================
+  # Data is already filtered by geography - just create aliases for compatibility
 
   tar_target(
     name = data_residence,
-    command = filter_by_location(
-      data_consolidated_clean,
-      filter_by = "residence",
-      territoriale = classifiers$territoriale
-    ),
-    format = "fst"  # FST preserves IDate type correctly
+    command = data_consolidated_clean_residence,
+    format = "fst"
   ),
 
-  # Workplace branch
   tar_target(
     name = data_workplace,
-    command = filter_by_location(
-      data_consolidated_clean,
-      filter_by = "workplace",
-      territoriale = classifiers$territoriale
-    ),
-    format = "fst"  # FST preserves IDate type correctly
+    command = data_consolidated_clean_workplace,
+    format = "fst"
+  ),
+
+  # 30-day filtered versions
+  tar_target(
+    name = data_residence_30day,
+    command = {
+      data.table::setDT(data_consolidated_clean_residence)
+      data_consolidated_clean_residence[arco == 0 | durata >= 30]
+    },
+    format = "fst"
+  ),
+
+  tar_target(
+    name = data_workplace_30day,
+    command = {
+      data.table::setDT(data_consolidated_clean_workplace)
+      data_consolidated_clean_workplace[arco == 0 | durata >= 30]
+    },
+    format = "fst"
   ),
 
   # ============================================================================
@@ -477,6 +651,163 @@ list(
     name = sector_summary_stats_45day,
     command = compute_transition_summary_stats(
       sector_transitions_labeled_45day,
+      top_k = 10
+    ),
+    format = "qs"
+  ),
+
+  # ============================================================================
+  # 30-DAY DURATION FILTER: Transitions from contracts >= 30 days
+  # ============================================================================
+  # Compute transitions from data where short contracts (< 30 days) are excluded
+
+  tar_target(
+    name = closed_transitions_30day,
+    command = {
+      data.table::setDT(data_residence_30day)
+      compute_closed_transitions(data_residence_30day)
+    },
+    format = "qs"
+  ),
+
+  tar_target(
+    name = open_transitions_30day,
+    command = {
+      data.table::setDT(data_residence_30day)
+      compute_open_transitions(data_residence_30day, data.table::as.IDate("2024-12-31"))
+    },
+    format = "qs"
+  ),
+
+  tar_target(
+    name = unemployment_spells_30day,
+    command = {
+      data.table::setDT(data_residence_30day)
+      data_residence_30day[arco == 0 & (!is.na(did_attribute) | !is.na(pol_attribute)), .(
+        cf,
+        unemp_start = inizio,
+        unemp_end = fine,
+        did_attribute,
+        did_match_quality,
+        pol_attribute,
+        pol_match_quality
+      )]
+    },
+    format = "qs"
+  ),
+
+  tar_target(
+    name = transitions_combined_30day,
+    command = rbindlist(list(closed_transitions_30day, open_transitions_30day), fill = TRUE),
+    format = "qs"
+  ),
+
+  tar_target(
+    name = transitions_with_did_pol_30day,
+    command = add_did_pol_to_transitions(transitions_combined_30day, unemployment_spells_30day),
+    format = "qs"
+  ),
+
+  tar_target(
+    name = transitions_30day,
+    command = merge(transitions_with_did_pol_30day,
+                    demographics[, .(cf, sesso, cleta, istruzione)],
+                    by = "cf", all.x = TRUE),
+    format = "qs"
+  ),
+
+  tar_target(
+    name = transition_matrices_30day,
+    command = create_transition_matrices(transitions_30day),
+    format = "qs"
+  ),
+
+  # 30-day enrichment: extract raw matrices
+  tar_target(
+    name = profession_matrix_raw_30day,
+    command = transition_matrices_30day$profession,
+    format = "qs"
+  ),
+
+  tar_target(
+    name = sector_matrix_raw_30day,
+    command = transition_matrices_30day$sector,
+    format = "qs"
+  ),
+
+  # 30-day enrichment: add labels
+  tar_target(
+    name = profession_transitions_labeled_30day,
+    command = enrich_transition_matrix_with_labels(
+      profession_matrix_raw_30day,
+      classifiers$professioni,
+      code_col = "name",
+      label_col = "label"
+    ),
+    format = "qs"
+  ),
+
+  tar_target(
+    name = sector_transitions_labeled_30day,
+    command = enrich_transition_matrix_with_labels(
+      sector_matrix_raw_30day,
+      classifiers$settori,
+      code_col = "ateco",
+      label_col = "nome"
+    ),
+    format = "qs"
+  ),
+
+  # 30-day enrichment: convert to matrix format
+  tar_target(
+    name = profession_matrix_30day,
+    command = convert_transitions_to_matrix(profession_transitions_labeled_30day),
+    format = "qs"
+  ),
+
+  tar_target(
+    name = sector_matrix_30day,
+    command = convert_transitions_to_matrix(sector_transitions_labeled_30day),
+    format = "qs"
+  ),
+
+  # 30-day enrichment: network plots
+  tar_target(
+    name = profession_network_plot_30day,
+    command = create_transition_network_plot(
+      profession_transitions_labeled_30day,
+      title = "Profession Transition Network (30+ Day Contracts)",
+      top_n = 50,
+      min_transitions = 5
+    ),
+    format = "qs"
+  ),
+
+  tar_target(
+    name = sector_network_plot_30day,
+    command = create_transition_network_plot(
+      sector_transitions_labeled_30day,
+      title = "Sector Transition Network (30+ Day Contracts)",
+      top_n = 50,
+      min_transitions = 5
+    ),
+    format = "qs"
+  ),
+
+  # 30-day enrichment: summary statistics
+  tar_target(
+    name = profession_summary_stats_30day,
+    command = compute_transition_summary_stats(
+      profession_transitions_labeled_30day,
+      top_k = 10
+    ),
+    format = "qs"
+  ),
+
+  tar_target(
+    name = sector_summary_stats_30day,
+    command = compute_transition_summary_stats(
+      sector_transitions_labeled_30day,
       top_k = 10
     ),
     format = "qs"
@@ -844,6 +1175,162 @@ list(
     format = "qs"
   ),
 
+  # ============================================================================
+  # 30-DAY DURATION FILTER (WORKPLACE): Transitions from contracts >= 30 days
+  # ============================================================================
+
+  tar_target(
+    name = closed_transitions_30day_workplace,
+    command = {
+      data.table::setDT(data_workplace_30day)
+      compute_closed_transitions(data_workplace_30day)
+    },
+    format = "qs"
+  ),
+
+  tar_target(
+    name = open_transitions_30day_workplace,
+    command = {
+      data.table::setDT(data_workplace_30day)
+      compute_open_transitions(data_workplace_30day, data.table::as.IDate("2024-12-31"))
+    },
+    format = "qs"
+  ),
+
+  tar_target(
+    name = unemployment_spells_30day_workplace,
+    command = {
+      data.table::setDT(data_workplace_30day)
+      data_workplace_30day[arco == 0 & (!is.na(did_attribute) | !is.na(pol_attribute)), .(
+        cf,
+        unemp_start = inizio,
+        unemp_end = fine,
+        did_attribute,
+        did_match_quality,
+        pol_attribute,
+        pol_match_quality
+      )]
+    },
+    format = "qs"
+  ),
+
+  tar_target(
+    name = transitions_combined_30day_workplace,
+    command = rbindlist(list(closed_transitions_30day_workplace, open_transitions_30day_workplace), fill = TRUE),
+    format = "qs"
+  ),
+
+  tar_target(
+    name = transitions_with_did_pol_30day_workplace,
+    command = add_did_pol_to_transitions(transitions_combined_30day_workplace, unemployment_spells_30day_workplace),
+    format = "qs"
+  ),
+
+  tar_target(
+    name = transitions_30day_workplace,
+    command = merge(transitions_with_did_pol_30day_workplace,
+                    demographics_workplace[, .(cf, sesso, cleta, istruzione)],
+                    by = "cf", all.x = TRUE),
+    format = "qs"
+  ),
+
+  tar_target(
+    name = transition_matrices_30day_workplace,
+    command = create_transition_matrices(transitions_30day_workplace),
+    format = "qs"
+  ),
+
+  # 30-day workplace enrichment: extract raw matrices
+  tar_target(
+    name = profession_matrix_raw_30day_workplace,
+    command = transition_matrices_30day_workplace$profession,
+    format = "qs"
+  ),
+
+  tar_target(
+    name = sector_matrix_raw_30day_workplace,
+    command = transition_matrices_30day_workplace$sector,
+    format = "qs"
+  ),
+
+  # 30-day workplace enrichment: add labels
+  tar_target(
+    name = profession_transitions_labeled_30day_workplace,
+    command = enrich_transition_matrix_with_labels(
+      profession_matrix_raw_30day_workplace,
+      classifiers$professioni,
+      code_col = "name",
+      label_col = "label"
+    ),
+    format = "qs"
+  ),
+
+  tar_target(
+    name = sector_transitions_labeled_30day_workplace,
+    command = enrich_transition_matrix_with_labels(
+      sector_matrix_raw_30day_workplace,
+      classifiers$settori,
+      code_col = "ateco",
+      label_col = "nome"
+    ),
+    format = "qs"
+  ),
+
+  # 30-day workplace enrichment: convert to matrix format
+  tar_target(
+    name = profession_matrix_30day_workplace,
+    command = convert_transitions_to_matrix(profession_transitions_labeled_30day_workplace),
+    format = "qs"
+  ),
+
+  tar_target(
+    name = sector_matrix_30day_workplace,
+    command = convert_transitions_to_matrix(sector_transitions_labeled_30day_workplace),
+    format = "qs"
+  ),
+
+  # 30-day workplace enrichment: network plots
+  tar_target(
+    name = profession_network_plot_30day_workplace,
+    command = create_transition_network_plot(
+      profession_transitions_labeled_30day_workplace,
+      title = "Profession Transition Network (Workplace, 30+ Day Contracts)",
+      top_n = 50,
+      min_transitions = 5
+    ),
+    format = "qs"
+  ),
+
+  tar_target(
+    name = sector_network_plot_30day_workplace,
+    command = create_transition_network_plot(
+      sector_transitions_labeled_30day_workplace,
+      title = "Sector Transition Network (Workplace, 30+ Day Contracts)",
+      top_n = 50,
+      min_transitions = 5
+    ),
+    format = "qs"
+  ),
+
+  # 30-day workplace enrichment: summary statistics
+  tar_target(
+    name = profession_summary_stats_30day_workplace,
+    command = compute_transition_summary_stats(
+      profession_transitions_labeled_30day_workplace,
+      top_k = 10
+    ),
+    format = "qs"
+  ),
+
+  tar_target(
+    name = sector_summary_stats_30day_workplace,
+    command = compute_transition_summary_stats(
+      sector_transitions_labeled_30day_workplace,
+      top_k = 10
+    ),
+    format = "qs"
+  ),
+
   # 9. MONECA Labor Market Segmentation -----
 
   # 9.0 Cutoff Analysis (Pre-compute optimal cutoffs) -----
@@ -862,10 +1349,12 @@ list(
 
       # Find optimal cutoff using moneca's find_optimal_cutoff
       # Note: Explicit cutoff_range needed due to extreme RR values in real data
+      # Using "elbow" criterion: automated elbow detection for faster optimization
+      # Lower range for 3-level segmentation (produces more clustering)
       cutoff_result <- moneca::find_optimal_cutoff(
         mx = mx_with_margins,
         criterion = "elbow",
-        cutoff_range = seq(1.5, 8, by = 0.25),
+        cutoff_range = seq(1.0, 5, by = 0.25),
         n_bootstrap = 30,
         verbose = TRUE
       )
@@ -895,10 +1384,12 @@ list(
 
       # Find optimal cutoff using moneca's find_optimal_cutoff
       # Note: Explicit cutoff_range needed due to extreme RR values in real data
+      # Using "elbow" criterion: automated elbow detection for faster optimization
+      # Lower range for 3-level segmentation (produces more clustering)
       cutoff_result <- moneca::find_optimal_cutoff(
         mx = mx_with_margins,
         criterion = "elbow",
-        cutoff_range = seq(1.5, 8, by = 0.25),
+        cutoff_range = seq(1.0, 5, by = 0.25),
         n_bootstrap = 30,
         verbose = TRUE
       )
@@ -924,7 +1415,9 @@ list(
       cluster_labor_market(
         mobility_matrix = mx_with_margins,
         cut_off = optimal_cutoff_standard,
-        segment_levels = 2,
+        segment_levels = 3,
+        small_cell_reduction = 0,
+        use_maximal_cliques = TRUE,
         verbose = TRUE
       )
     },
@@ -969,7 +1462,9 @@ list(
       cluster_labor_market(
         mobility_matrix = mx_with_margins,
         cut_off = optimal_cutoff_45day,
-        segment_levels = 2,
+        segment_levels = 3,
+        small_cell_reduction = 0,
+        use_maximal_cliques = TRUE,
         verbose = TRUE
       )
     },
@@ -1232,6 +1727,15 @@ list(
       saveRDS(profession_summary_stats_45day, file.path(output_dir, "profession_summary_stats_45day.rds"))
       saveRDS(sector_summary_stats_45day, file.path(output_dir, "sector_summary_stats_45day.rds"))
 
+      # Save 30-day duration transition matrices and statistics
+      saveRDS(transition_matrices_30day, file.path(output_dir, "transition_matrices_30day.rds"))
+      saveRDS(profession_transitions_labeled_30day, file.path(output_dir, "profession_transitions_30day.rds"))
+      saveRDS(sector_transitions_labeled_30day, file.path(output_dir, "sector_transitions_30day.rds"))
+      saveRDS(profession_matrix_30day, file.path(output_dir, "profession_matrix_30day.rds"))
+      saveRDS(sector_matrix_30day, file.path(output_dir, "sector_matrix_30day.rds"))
+      saveRDS(profession_summary_stats_30day, file.path(output_dir, "profession_summary_stats_30day.rds"))
+      saveRDS(sector_summary_stats_30day, file.path(output_dir, "sector_summary_stats_30day.rds"))
+
       # Return indicator
       "rds_files_saved"
     },
@@ -1290,8 +1794,31 @@ list(
         bg = "white"
       )
 
+      # Save 30-day duration profession network plot
+      prof_plot_path_30day <- file.path(plots_dir, "profession_network_30day.png")
+      ggplot2::ggsave(
+        filename = prof_plot_path_30day,
+        plot = profession_network_plot_30day,
+        width = 12,
+        height = 10,
+        dpi = 300,
+        bg = "white"
+      )
+
+      # Save 30-day duration sector network plot
+      sector_plot_path_30day <- file.path(plots_dir, "sector_network_30day.png")
+      ggplot2::ggsave(
+        filename = sector_plot_path_30day,
+        plot = sector_network_plot_30day,
+        width = 12,
+        height = 10,
+        dpi = 300,
+        bg = "white"
+      )
+
       # Return vector of file paths for targets to track
-      c(prof_plot_path, sector_plot_path, prof_plot_path_45day, sector_plot_path_45day)
+      c(prof_plot_path, sector_plot_path, prof_plot_path_45day, sector_plot_path_45day,
+        prof_plot_path_30day, sector_plot_path_30day)
     },
     format = "file"
   ),
@@ -1355,6 +1882,15 @@ list(
       saveRDS(profession_summary_stats_45day_workplace, file.path(output_dir_workplace, "profession_summary_stats_45day.rds"))
       saveRDS(sector_summary_stats_45day_workplace, file.path(output_dir_workplace, "sector_summary_stats_45day.rds"))
 
+      # Save 30-day duration transition matrices and statistics
+      saveRDS(transition_matrices_30day_workplace, file.path(output_dir_workplace, "transition_matrices_30day.rds"))
+      saveRDS(profession_transitions_labeled_30day_workplace, file.path(output_dir_workplace, "profession_transitions_30day.rds"))
+      saveRDS(sector_transitions_labeled_30day_workplace, file.path(output_dir_workplace, "sector_transitions_30day.rds"))
+      saveRDS(profession_matrix_30day_workplace, file.path(output_dir_workplace, "profession_matrix_30day.rds"))
+      saveRDS(sector_matrix_30day_workplace, file.path(output_dir_workplace, "sector_matrix_30day.rds"))
+      saveRDS(profession_summary_stats_30day_workplace, file.path(output_dir_workplace, "profession_summary_stats_30day.rds"))
+      saveRDS(sector_summary_stats_30day_workplace, file.path(output_dir_workplace, "sector_summary_stats_30day.rds"))
+
       # Return indicator
       "rds_files_saved_workplace"
     },
@@ -1413,8 +1949,31 @@ list(
         bg = "white"
       )
 
+      # Save 30-day duration profession network plot
+      prof_plot_path_30day <- file.path(plots_dir, "profession_network_30day.png")
+      ggplot2::ggsave(
+        filename = prof_plot_path_30day,
+        plot = profession_network_plot_30day_workplace,
+        width = 12,
+        height = 10,
+        dpi = 300,
+        bg = "white"
+      )
+
+      # Save 30-day duration sector network plot
+      sector_plot_path_30day <- file.path(plots_dir, "sector_network_30day.png")
+      ggplot2::ggsave(
+        filename = sector_plot_path_30day,
+        plot = sector_network_plot_30day_workplace,
+        width = 12,
+        height = 10,
+        dpi = 300,
+        bg = "white"
+      )
+
       # Return vector of file paths for targets to track
-      c(prof_plot_path, sector_plot_path, prof_plot_path_45day, sector_plot_path_45day)
+      c(prof_plot_path, sector_plot_path, prof_plot_path_45day, sector_plot_path_45day,
+        prof_plot_path_30day, sector_plot_path_30day)
     },
     format = "file"
   ),
@@ -1487,7 +2046,7 @@ list(
     name = validation_report,
     command = {
       # Ensure FST-loaded data is converted to data.table
-      data.table::setDT(data_consolidated_clean)
+      data.table::setDT(data_vecshift)
       data.table::setDT(data_residence)
       data.table::setDT(data_workplace)
       data.table::setDT(transitions)
@@ -1504,11 +2063,11 @@ list(
 
       cat("PHASE 2: Consolidation (BEFORE filtering)\n")
       cat("------------------------------------------\n")
-      cat("  Consolidated records:", nrow(data_consolidated_clean), "\n")
-      cat("  Unique individuals:", data_consolidated_clean[, uniqueN(cf)], "\n")
+      cat("  Vecshift consolidated records:", nrow(data_vecshift), "\n")
+      cat("  Unique individuals:", data_vecshift[, uniqueN(cf)], "\n")
       cat("  Date range:",
-          format(data_consolidated_clean[, min(inizio, na.rm = TRUE)], "%Y-%m-%d"), "to",
-          format(data_consolidated_clean[, max(fine, na.rm = TRUE)], "%Y-%m-%d"), "\n\n")
+          format(data_vecshift[, min(inizio, na.rm = TRUE)], "%Y-%m-%d"), "to",
+          format(data_vecshift[, max(fine, na.rm = TRUE)], "%Y-%m-%d"), "\n\n")
 
       cat("PHASE 3: Geographic Filtering\n")
       cat("------------------------------\n")
@@ -1588,7 +2147,7 @@ list(
         consolidation_before_filtering = TRUE,
         data_summary = list(
           n_raw = nrow(raw_contracts),
-          n_consolidated = nrow(data_consolidated_clean),
+          n_vecshift = nrow(data_vecshift),
           n_residence = nrow(data_residence),
           n_workplace = nrow(data_workplace),
           n_transitions_residence = nrow(transitions),

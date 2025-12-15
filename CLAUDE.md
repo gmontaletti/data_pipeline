@@ -30,23 +30,26 @@ The pipeline uses the `targets` framework (_targets.R) to orchestrate a **DUAL-B
 - Select relevant columns
 - **KEY**: Both COMUNE_LAVORATORE and COMUNE_SEDE_LAVORO are preserved at this stage
 
-**Phase 2: FORK - Apply Location Filters**
-- Branch A: Filter by residence (COMUNE_LAVORATORE) → residence pipeline
-- Branch B: Filter by workplace (COMUNE_SEDE_LAVORO) → workplace pipeline
+**Phase 2: Consolidate with Early Geographic Fork**
+- Step 1: Single vecshift consolidation on full Lombardia-connected data (shared)
+- Step 2: FORK by geography (residence vs workplace) - happens BEFORE adding unemployment to avoid memory explosion
+- Steps 3-5: Parallel consolidation chains for each branch
 
 **Phase 3-12: Parallel Processing** (both branches execute independently)
 
 Each branch then processes through:
-3. **Consolidate & Enrich** → Vecshift consolidation (overlaps) → Add unemployment periods → Match DID/POL events → LongworkR consolidation (short gaps) → Add CPI/ATECO enrichment
+3. **Add Unemployment & Enrich** → Add unemployment periods → Merge attributes → Match DID/POL events → LongworkR consolidation (short gaps) → Add CPI/ATECO enrichment
 4. **Compute Transitions** → Extract demographics, compute closed and open transitions, enrich with DID/POL
 5. **Create Transition Matrices** → Aggregate by contract type, profession, sector (standard + 45-day lag)
 6. **Career Metrics & Survival** → Compute survival curves and trajectory metrics
 7. **Career Clustering** → Cluster trajectories, create person-level dataset
 8. **Geographic Aggregations** → Summaries by area and CPI
-9. **Time Series** → Monthly aggregates
-10. **Policy Summary** → DID/POL effectiveness analysis
-11. **Policy Coverage Precomputations** → Dashboard performance optimizations
-12. **File Outputs** → Write to separate output directories
+9. **MONECA Labor Market Segmentation** → Cluster sectors by mobility patterns, generate naming templates, compute segment-based specializations (workplace branch only, conditional on manual naming)
+10. **Annual Coverage Estimation** → Calculate FTE by year, comune, sector (workplace branch only)
+11. **Time Series** → Monthly aggregates
+12. **Policy Summary** → DID/POL effectiveness analysis
+13. **Policy Coverage Precomputations** → Dashboard performance optimizations
+14. **File Outputs** → Write to separate output directories
 
 ### 45-Day Lag Analysis
 The pipeline computes transition matrices in two variants:
@@ -55,12 +58,15 @@ The pipeline computes transition matrices in two variants:
 
 ## Key R Modules (R/ directory)
 
-- **data_preparation.R**: NEW - Raw data loading, contract harmonization, location filtering, vecshift preparation
+- **data_preparation.R**: Raw data loading, contract harmonization, location filtering (pre and post-vecshift), vecshift preparation
 - **data_loading.R**: Consolidate employment spells (vecshift + longworkR), standardize ATECO codes, add CPI geographic info
 - **transitions.R**: Core transition computation (closed/open), DID/POL enrichment, transition matrices
 - **aggregations.R**: Person-level data, geographic summaries, monthly time series, policy summaries
 - **policy_aggregates.R**: Precomputed policy coverage aggregates for dashboard performance
 - **career_analysis.R**: Survival analysis and career metrics computation
+- **coverage_analysis.R**: Annual contractual coverage estimation (FTE by year, Comune, sector)
+- **balassa_specialization.R**: Balassa index calculation and territorial specialization mapping (with situas integration), segment-based specialization functions
+- **moneca_segmentation.R**: MONECA clustering for labor market segmentation, template generation for manual segment naming, segment membership extraction and composition analysis
 - **classifiers.R**: Load contract type/profession/sector/territorial classification tables
 - **transition_enrichment.R**: Add labels to transition matrices, create network visualizations, compute summary statistics
 - **utils_geographic.R**: Geographic utilities (CPI mapping via Belfiore codes)
@@ -128,6 +134,8 @@ The pipeline now processes data in **TWO ways**:
 **External packages**:
 - `longworkR` package from `~/Documents/funzioni/longworkR/` (development version)
 - `vecshift` package from `~/Documents/funzioni/vecshift/` (development version)
+- `moneca` package from GitHub: `gmontaletti/MONECA` (for labor market segmentation)
+- `situas` package from GitHub: `gmontaletti/situas` (for Lombardy geographic data)
 
 **Reference materials**: Non-code documentation and references stored at `../reference/data_pipeline/` (outside git repository)
 
@@ -143,6 +151,9 @@ Both directories contain identical file structures:
 - `transitions.fst`: All transitions with full attributes (108M+ records)
 - `person_data.fst`: Person-level summary (demographics + career metrics + clusters)
 - `monthly_timeseries.fst`, `monthly_timeseries_cpi.fst`: Monthly aggregates
+- `annual_coverage_by_year_comune_sector.fst`: Annual FTE coverage by year, workplace Comune, and sector with Balassa index (workplace branch only)
+- `coverage_with_segments_standard.fst`: Annual coverage by year/comune/segment with Balassa index (conditional, workplace branch only)
+- `coverage_with_segments_45day.fst`: Same for 45-day segmentation (conditional, workplace branch only)
 
 **Lookup tables & summaries (RDS format)**:
 - `classifiers.rds`: Contract/profession/sector lookups
@@ -153,12 +164,28 @@ Both directories contain identical file structures:
 - `profession_summary_stats.rds`, `sector_summary_stats.rds`: Top transitions, mobility indices
 - `geo_summary.rds`, `geo_summary_cpi.rds`: Geographic aggregates
 - `policy_*.rds`: Precomputed policy coverage aggregates (timeseries, demographics, geography, duration distributions)
+- `comuni_specialization_2024.rds`: Spatial dataframe (sf) with Balassa indices and specializations by comune (workplace branch only)
+- `moneca_standard.rds`, `moneca_45day.rds`: MONECA clustering objects (workplace branch only)
+- `segment_membership_standard.rds`, `segment_membership_45day.rds`: Sector→segment mappings (workplace branch only)
+- `segment_composition_standard.rds`, `segment_composition_45day.rds`: Segment statistics (workplace branch only)
+- `segment_membership_named_standard.rds`, `segment_membership_named_45day.rds`: Named memberships (conditional, workplace branch only)
+- `comuni_specialization_segments_standard_2024.rds`, `comuni_specialization_segments_45day_2024.rds`: Spatial dataframes with segment specializations (conditional, workplace branch only)
 
 **Visualizations (PNG)**:
 - `plots/profession_network.png`, `plots/sector_network.png`: Network graphs
 - `plots/profession_network_8day.png`, `plots/sector_network_8day.png`: 45-day lag networks
 
+**Templates for manual naming** (reference/data_pipeline/):
+- `segment_names_standard.R`: Template for naming standard segmentation labor market segments
+- `segment_names_45day.R`: Template for naming 45-day lag segmentation labor market segments
+
 ## Important Implementation Notes
+
+### Terminology
+- **DID**: Stands for "Dichiarazione di Immediata Disponibilità" (Declaration of Immediate Availability) - the unemployment declaration system
+- **POL**: Stands for "Politiche Attive" (Active Labor Market Policies) - general active labor market policy interventions
+- **NASPI**: Unemployment benefits program (often referenced alongside DID data)
+- Note: DID is NOT "Dote Impresa" (that's a different program)
 
 ### Never modify these patterns
 - **Never change the original moneca() function** (if present in related packages)

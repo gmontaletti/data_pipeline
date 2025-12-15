@@ -40,6 +40,11 @@ prepare_matrix_for_moneca <- function(mobility_matrix) {
 #'   requires matrices with margins to calculate relative risk.
 #' @param cut_off Numeric. Minimum relative risk threshold (from cutoff analysis)
 #' @param segment_levels Integer. Number of hierarchical levels (default: 3)
+#' @param small_cell_reduction Numeric. Value to handle small cell counts in the
+#'   mobility matrix. Higher values can significantly speed up clustering by
+#'   reducing matrix complexity. Default is 10. Set to 0 to disable.
+#' @param use_maximal_cliques Logical. Use maximal cliques optimization for faster
+#'   clustering (default: TRUE). This can significantly speed up the algorithm.
 #' @param verbose Logical. Print progress messages (default: TRUE)
 #'
 #' @return List with components:
@@ -51,6 +56,8 @@ prepare_matrix_for_moneca <- function(mobility_matrix) {
 cluster_labor_market <- function(mobility_matrix,
                                   cut_off,
                                   segment_levels = 3,
+                                  small_cell_reduction = 30,
+                                  use_maximal_cliques = TRUE,
                                   verbose = TRUE) {
 
   # 1. Validate inputs -----
@@ -99,6 +106,7 @@ cluster_labor_market <- function(mobility_matrix,
     cat("Matrix dimensions:", nrow(mobility_matrix), "x", ncol(mobility_matrix), "\n")
     cat("Using cutoff:", cut_off, "\n")
     cat("Segment levels:", segment_levels, "\n")
+    cat("Small cell reduction:", small_cell_reduction, "\n")
   }
 
   # Run MONECA fast (no auto-tuning)
@@ -108,13 +116,19 @@ cluster_labor_market <- function(mobility_matrix,
     cut.off = cut_off,
     mode = "symmetric",
     delete.upper.tri = TRUE,
-    small.cell.reduction = 0,
+    small.cell.reduction = small_cell_reduction,
+    use_maximal_cliques = use_maximal_cliques,
     progress = verbose,
     auto_tune = FALSE
   )
 
-  # Extract segment membership
-  membership_result <- extract_segment_membership(moneca_result, verbose = verbose)
+  # Extract segment membership from the coarsest level (segment_levels)
+  # Level 1 is finest (most segments), level N is coarsest (fewest segments)
+  membership_result <- extract_segment_membership(
+    moneca_result,
+    level = segment_levels,  # Use coarsest level for meaningful clustering
+    verbose = verbose
+  )
 
   if (verbose) {
     cat("Clustering complete:\n")
@@ -136,7 +150,8 @@ cluster_labor_market <- function(mobility_matrix,
 #' data.table with segment sizes.
 #'
 #' @param moneca_object Output from moneca::moneca()
-#' @param level Integer. Hierarchy level to extract (default: 1, finest level)
+#' @param level Integer. Hierarchy level to extract (default: 1, finest level).
+#'   Level 1 is the finest (most segments), higher levels are coarser (fewer segments)
 #' @param verbose Logical. Print extraction summary (default: FALSE)
 #'
 #' @return List with:
@@ -212,41 +227,43 @@ analyze_segment_composition <- function(membership,
   # Compute within-segment and outgoing transition volumes
   membership_dt <- data.table::copy(membership)
 
-  # Extract transitions involving each segment
-  transition_volumes <- data.table::data.table()
+  # Extract transitions involving each segment using lapply pattern
+  segment_ids <- unique(membership_dt$segment_id)
 
-  for (seg_id in unique(membership_dt$segment_id)) {
-    seg_sectors <- membership_dt[segment_id == seg_id, sector]
+  transition_volumes <- data.table::rbindlist(
+    lapply(segment_ids, function(seg_id) {
+      seg_sectors <- membership_dt[segment_id == seg_id, sector]
 
-    # Sum all transitions from this segment's sectors
-    seg_matrix <- mobility_matrix[seg_sectors, , drop = FALSE]
-    total_trans <- sum(seg_matrix, na.rm = TRUE)
+      # Sum all transitions from this segment's sectors
+      seg_matrix <- mobility_matrix[seg_sectors, , drop = FALSE]
+      total_trans <- sum(seg_matrix, na.rm = TRUE)
 
-    # Within-segment transitions
-    within_matrix <- mobility_matrix[seg_sectors, seg_sectors, drop = FALSE]
-    within_trans <- sum(within_matrix, na.rm = TRUE)
+      # Within-segment transitions
+      within_matrix <- mobility_matrix[seg_sectors, seg_sectors, drop = FALSE]
+      within_trans <- sum(within_matrix, na.rm = TRUE)
 
-    # Compute sector shares within segment
-    sector_shares <- data.table::data.table(
-      sector = seg_sectors,
-      volume = rowSums(seg_matrix, na.rm = TRUE)
-    )
-    data.table::setorder(sector_shares, -volume)
+      # Compute sector shares within segment
+      sector_shares <- data.table::data.table(
+        sector = seg_sectors,
+        volume = rowSums(seg_matrix, na.rm = TRUE)
+      )
+      data.table::setorder(sector_shares, -volume)
 
-    transition_volumes <- data.table::rbindlist(list(
-      transition_volumes,
+      # Return data.table row with explicit type coercion
       data.table::data.table(
-        segment_id = seg_id,
-        n_sectors = length(seg_sectors),
+        segment_id = as.character(seg_id),
+        n_sectors = as.integer(length(seg_sectors)),
         sectors = list(seg_sectors),
-        total_transitions = total_trans,
-        within_transitions = within_trans,
-        cohesion = within_trans / total_trans,
+        total_transitions = as.numeric(total_trans),
+        within_transitions = as.numeric(within_trans),
+        cohesion = as.numeric(within_trans / total_trans),
         dominant_sectors = list(sector_shares$sector[1:min(5, nrow(sector_shares))]),
         sector_volumes = list(sector_shares$volume[1:min(5, nrow(sector_shares))])
       )
-    ), fill = TRUE)
-  }
+    }),
+    use.names = TRUE,
+    fill = TRUE
+  )
 
   # Add sector labels if classifiers provided
   if (!is.null(classifiers) && "ateco" %in% names(classifiers)) {
@@ -268,10 +285,10 @@ analyze_segment_composition <- function(membership,
 
   # Add demographic info if transitions_data provided
   if (!is.null(transitions_data) && "from_sector" %in% names(transitions_data)) {
+    # Compute sector-level statistics with explicit type coercion
     demo_stats <- transitions_data[, .(
-      avg_salary = mean(from_salary, na.rm = TRUE),
-      median_age = median(cleta, na.rm = TRUE),
-      pct_female = mean(sesso == "F", na.rm = TRUE) * 100
+      avg_salary = as.numeric(mean(from_salary, na.rm = TRUE)),
+      pct_female = as.numeric(mean(sesso == "F", na.rm = TRUE) * 100)
     ), by = from_sector]
 
     data.table::setnames(demo_stats, "from_sector", "sector")
@@ -279,11 +296,10 @@ analyze_segment_composition <- function(membership,
     # Merge with membership
     membership_demo <- merge(membership_dt, demo_stats, by = "sector", all.x = TRUE)
 
-    # Aggregate by segment
+    # Aggregate by segment with explicit type coercion
     segment_demo <- membership_demo[, .(
-      segment_avg_salary = mean(avg_salary, na.rm = TRUE),
-      segment_median_age = mean(median_age, na.rm = TRUE),
-      segment_pct_female = mean(pct_female, na.rm = TRUE)
+      segment_avg_salary = as.numeric(mean(avg_salary, na.rm = TRUE)),
+      segment_pct_female = as.numeric(mean(pct_female, na.rm = TRUE))
     ), by = segment_id]
 
     transition_volumes <- merge(transition_volumes, segment_demo, by = "segment_id", all.x = TRUE)
@@ -349,7 +365,6 @@ generate_naming_template <- function(composition,
     # Add demographic info if available
     if ("segment_avg_salary" %in% names(seg)) {
       lines <- c(lines, paste0("  # Avg salary: €", format(round(seg$segment_avg_salary), big.mark=",")))
-      lines <- c(lines, paste0("  # Median age: ", round(seg$segment_median_age, 1), " years"))
       lines <- c(lines, paste0("  # Female: ", sprintf("%.1f%%", seg$segment_pct_female)))
     }
 

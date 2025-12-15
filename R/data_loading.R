@@ -51,6 +51,18 @@ consolidate_and_enrich <- function(prepared_data,
   prepared_data[, inizio := as.IDate(inizio)]
   prepared_data[, fine := as.IDate(fine)]
 
+  # MEMORY OPTIMIZATION: Filter contracts by date BEFORE consolidation
+  # Keep only contracts that overlap with the analysis period (fine >= min_date)
+  # This reduces memory usage significantly for vecshift consolidation
+  n_before_filter <- nrow(prepared_data)
+  prepared_data <- prepared_data[fine >= min_date]
+  n_after_filter <- nrow(prepared_data)
+  cat(sprintf("Date filter (fine >= %s): %s → %s rows (%.1f%% reduction)\n\n",
+              min_date,
+              format(n_before_filter, big.mark = ","),
+              format(n_after_filter, big.mark = ","),
+              100 * (n_before_filter - n_after_filter) / n_before_filter))
+
   # Step 1: Vecshift consolidation (overlaps)
   cat("STEP 1: Vecshift consolidation (overlapping spells)\n")
   cat("-" %+% rep("-", 70) %+% "\n")
@@ -76,7 +88,7 @@ consolidate_and_enrich <- function(prepared_data,
   pol_data[, DATA_INIZIO := as.IDate(DATA_INIZIO)]
   pol_data[, DATA_FINE := as.IDate(DATA_FINE)]
 
-  dt <- pipeline_match_events(dt, did_data, pol_data)
+  dt <- pipeline_match_events(dt, did_data, pol_data, min_date = min_date, max_date = max_date)
 
   # Step 5: LongworkR consolidation (short gaps)
   cat("\nSTEP 5: LongworkR consolidation (short gaps)\n")
@@ -93,6 +105,205 @@ consolidate_and_enrich <- function(prepared_data,
   # Step 6: Add geographic and ATECO enrichment
   cat("\nSTEP 6: Geographic and ATECO enrichment\n")
   cat("-" %+% rep("-", 70) %+% "\n")
+  dt <- add_geo_and_ateco(dt)
+
+  cat("\n")
+  cat("=" %+% rep("=", 70) %+% "\n")
+  cat(sprintf("✓ PIPELINE COMPLETE: %s final spells for %s individuals\n",
+              format(nrow(dt), big.mark = ","),
+              format(dt[, data.table::uniqueN(cf)], big.mark = ",")))
+  cat("=" %+% rep("=", 70) %+% "\n\n")
+
+  return(dt)
+}
+
+
+# 1.0.1 Memory-optimized pipeline functions (checkpointable) -----
+
+#' Apply vecshift consolidation only (Step 1 of memory-optimized pipeline)
+#'
+#' Standalone function for checkpointable pipeline. Applies vecshift
+#' consolidation to handle overlapping employment periods.
+#'
+#' @param prepared_data Prepared contract data from prepare_contracts()
+#' @param min_date Minimum date for filtering (contracts with fine >= min_date)
+#' @return data.table with consolidated (non-overlapping) employment spells
+#' @export
+apply_vecshift_only <- function(prepared_data, min_date = as.IDate("2021-01-01")) {
+  cat("\n")
+  cat("=" %+% rep("=", 70) %+% "\n")
+  cat("STEP 1: VECSHIFT CONSOLIDATION (CHECKPOINTED)\n")
+  cat("=" %+% rep("=", 70) %+% "\n\n")
+
+  # Ensure data.table after FST deserialization
+
+  data.table::setDT(prepared_data)
+  prepared_data[, inizio := as.IDate(inizio)]
+  prepared_data[, fine := as.IDate(fine)]
+
+  # Filter by date before consolidation (memory optimization)
+  n_before_filter <- nrow(prepared_data)
+  prepared_data <- prepared_data[fine >= min_date]
+  n_after_filter <- nrow(prepared_data)
+  cat(sprintf("Date filter (fine >= %s): %s → %s rows (%.1f%% reduction)\n",
+              min_date,
+              format(n_before_filter, big.mark = ","),
+              format(n_after_filter, big.mark = ","),
+              100 * (n_before_filter - n_after_filter) / n_before_filter))
+
+  # Apply vecshift consolidation
+  dt <- apply_vecshift_consolidation(prepared_data)
+
+  cat("✓ Step 1 complete - checkpoint saved as FST\n\n")
+  return(dt)
+}
+
+
+#' Add unemployment periods only (Step 2 of memory-optimized pipeline)
+#'
+#' Standalone function for checkpointable pipeline. Adds unemployment
+#' periods between employment spells.
+#'
+#' @param vecshift_data Data from apply_vecshift_only()
+#' @param min_date Minimum date for unemployment periods
+#' @param max_date Maximum date for unemployment periods
+#' @return data.table with employment and unemployment spells
+#' @export
+add_unemployment_only <- function(vecshift_data,
+                                   min_date = as.IDate("2021-01-01"),
+                                   max_date = as.IDate("2024-12-31")) {
+  cat("\n")
+  cat("=" %+% rep("=", 70) %+% "\n")
+  cat("STEP 2: ADD UNEMPLOYMENT PERIODS (CHECKPOINTED)\n")
+  cat("=" %+% rep("=", 70) %+% "\n\n")
+
+  # Ensure data.table after FST deserialization
+  data.table::setDT(vecshift_data)
+  vecshift_data[, inizio := as.IDate(inizio)]
+  vecshift_data[, fine := as.IDate(fine)]
+
+  # Add unemployment periods
+  dt <- pipeline_add_unemployment(vecshift_data, min_date = min_date, max_date = max_date)
+
+  cat("✓ Step 2 complete - checkpoint saved as FST\n\n")
+  return(dt)
+}
+
+
+#' Merge original attributes only (Step 3 of memory-optimized pipeline)
+#'
+#' Standalone function for checkpointable pipeline. Merges original
+#' contract attributes back after consolidation.
+#'
+#' @param data_with_unemployment Data from add_unemployment_only()
+#' @param prepared_data Original prepared data with all columns
+#' @return data.table with full attributes
+#' @export
+merge_attributes_only <- function(data_with_unemployment, prepared_data) {
+  cat("\n")
+  cat("=" %+% rep("=", 70) %+% "\n")
+  cat("STEP 3: MERGE ORIGINAL ATTRIBUTES (CHECKPOINTED)\n")
+  cat("=" %+% rep("=", 70) %+% "\n\n")
+
+  # Ensure data.table after FST deserialization
+  data.table::setDT(data_with_unemployment)
+  data.table::setDT(prepared_data)
+
+  data_with_unemployment[, inizio := as.IDate(inizio)]
+  data_with_unemployment[, fine := as.IDate(fine)]
+  prepared_data[, inizio := as.IDate(inizio)]
+  prepared_data[, fine := as.IDate(fine)]
+
+  # Merge attributes
+  dt <- pipeline_merge_attributes(data_with_unemployment, prepared_data)
+
+  cat("✓ Step 3 complete - checkpoint saved as FST\n\n")
+  return(dt)
+}
+
+
+#' Match DID/POL events with memory-safe mode (Step 4 of memory-optimized pipeline)
+#'
+#' Memory-optimized version of pipeline_match_events that enables vecshift's
+#' memory_safe mode and uses smaller batch sizes.
+#'
+#' @param data_with_attributes Data from merge_attributes_only()
+#' @param did_data DID data from load_raw_did()
+#' @param pol_data POL data from load_raw_pol()
+#' @param min_date Minimum date for filtering DID/POL events
+#' @param max_date Maximum date for filtering DID/POL events
+#' @return data.table with DID/POL flags on unemployment spells
+#' @export
+match_did_pol_memory_safe <- function(data_with_attributes,
+                                       did_data,
+                                       pol_data,
+                                       min_date = as.IDate("2021-01-01"),
+                                       max_date = as.IDate("2024-12-31")) {
+  cat("\n")
+  cat("=" %+% rep("=", 70) %+% "\n")
+  cat("STEP 4: MATCH DID/POL EVENTS - MEMORY SAFE (CHECKPOINTED)\n")
+  cat("=" %+% rep("=", 70) %+% "\n\n")
+
+  # Ensure data.table after FST deserialization
+  data.table::setDT(data_with_attributes)
+  data.table::setDT(did_data)
+  data.table::setDT(pol_data)
+
+  data_with_attributes[, inizio := as.IDate(inizio)]
+  data_with_attributes[, fine := as.IDate(fine)]
+  did_data[, DATA_EVENTO := as.IDate(DATA_EVENTO)]
+  pol_data[, DATA_INIZIO := as.IDate(DATA_INIZIO)]
+  pol_data[, DATA_FINE := as.IDate(DATA_FINE)]
+
+  # Call memory-safe version of event matching
+  dt <- pipeline_match_events_memory_safe(
+    data_with_attributes,
+    did_data,
+    pol_data,
+    min_date = min_date,
+    max_date = max_date
+  )
+
+  cat("✓ Step 4 complete - checkpoint saved as FST\n\n")
+  return(dt)
+}
+
+
+#' Final consolidation and enrichment (Step 5 of memory-optimized pipeline)
+#'
+#' Applies longworkR consolidation (short gaps) and geographic/ATECO enrichment.
+#' This is the final step that produces the data_consolidated output.
+#'
+#' @param data_with_did_pol Data from match_did_pol_memory_safe()
+#' @param variable_handling How to handle variables during longworkR consolidation
+#' @return data.table with final consolidated and enriched employment history
+#' @export
+consolidate_and_enrich_final <- function(data_with_did_pol,
+                                          variable_handling = "first") {
+  cat("\n")
+  cat("=" %+% rep("=", 70) %+% "\n")
+  cat("STEP 5: FINAL CONSOLIDATION + ENRICHMENT (CHECKPOINTED)\n")
+  cat("=" %+% rep("=", 70) %+% "\n\n")
+
+  # Ensure data.table after FST deserialization
+  data.table::setDT(data_with_did_pol)
+  data_with_did_pol[, inizio := as.IDate(inizio)]
+  data_with_did_pol[, fine := as.IDate(fine)]
+
+  dt <- data_with_did_pol
+
+  # Step 5a: LongworkR consolidation (short gaps)
+  cat("Applying LongworkR consolidation (short gaps)...\n")
+  n_before <- nrow(dt)
+  dt <- longworkR::consolidate_short_gaps(dt, variable_handling = variable_handling)
+  n_after <- nrow(dt)
+  n_consolidated <- n_before - n_after
+  pct_reduction <- 100 * n_consolidated / n_before
+  cat(sprintf("  ✓ Consolidated %s spells (%.1f%% reduction)\n",
+              format(n_consolidated, big.mark = ","), pct_reduction))
+
+  # Step 5b: Add geographic and ATECO enrichment
+  cat("\nAdding geographic and ATECO enrichment...\n")
   dt <- add_geo_and_ateco(dt)
 
   cat("\n")
@@ -219,7 +430,7 @@ enrich_with_policies <- function(filtered_data,
   pol_data[, DATA_INIZIO := as.IDate(DATA_INIZIO)]
   pol_data[, DATA_FINE := as.IDate(DATA_FINE)]
 
-  dt <- pipeline_match_events(dt, did_data, pol_data)
+  dt <- pipeline_match_events(dt, did_data, pol_data, min_date = min_date, max_date = max_date)
 
   # Step 4: Add geographic and ATECO enrichment
   cat("\nSTEP 4: Geographic and ATECO enrichment\n")

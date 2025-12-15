@@ -2,12 +2,46 @@
 
 #' Load raw contract data
 #'
-#' @param test_mode Logical. If TRUE, loads from sample directory (default: FALSE)
-#' @return data.table with raw contract data
+#' Loads employment contract data from either PostgreSQL database or FST file.
+#' When source="database", fetches from staging.mv_rapporti_cleaned and applies
+#' column mapping to convert lowercase names to UPPERCASE format.
+#'
+#' @param test_mode Logical. If TRUE, loads from sample directory (default: FALSE).
+#'   Only applies when source="fst".
+#' @param source Data source: "auto" (prefer database if available), "database",
+#'   or "fst". Default is "auto".
+#' @return data.table with raw contract data in UPPERCASE column format
 #' @export
-load_raw_contracts <- function(test_mode = FALSE) {
+load_raw_contracts <- function(test_mode = FALSE,
+                               source = c("auto", "database", "fst")) {
+  source <- match.arg(source)
 
-  # Determine file path based on test_mode
+  # Auto-detect: prefer database if available, fallback to FST
+
+  if (source == "auto") {
+    source <- if (db_available()) "database" else "fst"
+    cat(sprintf("Data source auto-detected: %s\n", source))
+  }
+
+  # Database source: fetch from PostgreSQL and map columns
+  if (source == "database") {
+    cat("Loading raw contracts from PostgreSQL database...\n")
+
+    # Ensure MV exists (does not create, just verifies)
+    ensure_materialized_view(refresh = FALSE)
+
+    # Fetch data (lowercase columns)
+    dt <- fetch_from_mv()
+
+    # Map to UPPERCASE format expected by prepare_contracts()
+    dt <- map_db_columns(dt)
+
+    cat(sprintf("  Loaded %s contracts from database\n",
+                format(nrow(dt), big.mark = ",")))
+    return(dt)
+  }
+
+  # FST source: load from file (existing logic)
   shared_data <- Sys.getenv("SHARED_DATA_DIR")
 
   if (test_mode) {
@@ -23,7 +57,82 @@ load_raw_contracts <- function(test_mode = FALSE) {
   }
 
   dt <- fst::read_fst(rap_path, as.data.table = TRUE)
+
+  # Check if FST file has lowercase columns (from rapporti pipeline)
+  # and map them if needed
+  if ("inizio" %in% names(dt) && !"INIZIO" %in% names(dt)) {
+    cat("  FST file has lowercase columns, applying column mapping...\n")
+    dt <- map_db_columns(dt)
+  }
+
   cat(sprintf("  Loaded %s contracts\n", format(nrow(dt), big.mark = ",")))
+
+  return(dt)
+}
+
+
+#' Map database column names to expected format
+#'
+#' Converts lowercase columns from staging.mv_rapporti_cleaned to
+#' UPPERCASE format expected by prepare_contracts().
+#'
+#' Handles:
+#' - Column renaming: lowercase → UPPERCASE
+#' - Derived columns: prior (0/1) → COD_TIPO_ORARIO (F/P)
+#' - ID mapping: id → ID_RAPPORTO, datore → cfd
+#'
+#' @param dt data.table from fetch_from_mv() or FST file
+#' @return data.table with renamed/mapped columns
+#' @export
+map_db_columns <- function(dt) {
+  cat("Mapping database column names to pipeline format...\n")
+
+  n_before <- ncol(dt)
+
+  # Column renaming: lowercase → UPPERCASE
+  # Using skip_absent=TRUE to handle partial column sets
+  data.table::setnames(dt, old = c(
+    "inizio", "fine", "qualifica", "ateco_gruppo", "ore",
+    "retribuzione", "cod_tipologia_contrattuale",
+    "ini_cod_tipologia_contrattuale", "eta", "sesso",
+    "liv_istruzione_lav", "comune_lavoratore", "comune_sede_lavoro"
+  ), new = c(
+    "INIZIO", "FINE", "COD_QUALIFICA_PROF_ISTAT_3DGT", "ATECO_GRUPPO", "ORE_SETTIM_MEDIE",
+    "RETRIBUZIONE", "COD_TIPOLOGIA_CONTRATTUALE",
+    "INI_COD_TIPOLOGIA_CONTRATTUALE", "ETA_LAV_INIZIO", "SESSO_LAV",
+    "LIV_ISTRUZIONE_LAV", "COMUNE_LAVORATORE", "COMUNE_SEDE_LAVORO"
+  ), skip_absent = TRUE)
+
+  # Derived column handling:
+
+
+  # 1. prior (0/1) → COD_TIPO_ORARIO (F/P)
+  if ("prior" %in% names(dt) && !"COD_TIPO_ORARIO" %in% names(dt)) {
+    dt[, COD_TIPO_ORARIO := data.table::fifelse(prior == 1, "F", "P")]
+    cat("  Created COD_TIPO_ORARIO from prior\n")
+  }
+
+  # 2. datore (numeric ID) → cfd
+  if ("datore" %in% names(dt) && !"cfd" %in% names(dt)) {
+    data.table::setnames(dt, "datore", "cfd")
+    cat("  Renamed datore → cfd\n")
+  }
+
+  # 3. id (row number) → ID_RAPPORTO
+  if ("id" %in% names(dt) && !"ID_RAPPORTO" %in% names(dt)) {
+    data.table::setnames(dt, "id", "ID_RAPPORTO")
+    cat("  Renamed id → ID_RAPPORTO\n")
+  }
+
+  # Convert dates to IDate for consistency
+  if ("INIZIO" %in% names(dt)) {
+    dt[, INIZIO := data.table::as.IDate(INIZIO)]
+  }
+  if ("FINE" %in% names(dt)) {
+    dt[, FINE := data.table::as.IDate(FINE)]
+  }
+
+  cat(sprintf("  Mapped %d columns\n", ncol(dt)))
 
   return(dt)
 }
@@ -55,7 +164,7 @@ load_raw_did <- function(test_mode = FALSE) {
 
   # Filter to valid DID statuses and ensure proper IDate class
   did <- did[STATO_DID %in% c("Inserita", "Convalidata", "Sospesa"),
-             .(cf, DATA_EVENTO = as.IDate(DATA_EVENTO), DID_NASPI)]
+             list(cf, DATA_EVENTO = as.IDate(DATA_EVENTO), DID_NASPI)]
 
   cat(sprintf("  Loaded %s DID records (filtered to valid statuses)\n",
               format(nrow(did), big.mark = ",")))
@@ -90,14 +199,14 @@ load_raw_pol <- function(test_mode = FALSE) {
 
   # Aggregate policies by person and date range, ensuring proper IDate class
   data.table::setkey(pol, cf, DATA_INIZIO)
-  pol <- pol[!is.na(DATA_INIZIO), .(cf, DATA_INIZIO, DATA_FINE, DESCRIZIONE)]
-  pol <- pol[, .(descrizione = paste(DESCRIZIONE, collapse = " "),
-                 DATA_INIZIO = as.IDate(DATA_INIZIO[1]),
-                 DATA_FINE = as.IDate(DATA_FINE[1])),
-             by = .(cf, DATA_INIZIO, DATA_FINE)]
+  pol <- pol[!is.na(DATA_INIZIO), list(cf, DATA_INIZIO, DATA_FINE, DESCRIZIONE)]
+  pol <- pol[, list(descrizione = paste(DESCRIZIONE, collapse = " "),
+                    DATA_INIZIO = as.IDate(DATA_INIZIO[1]),
+                    DATA_FINE = as.IDate(DATA_FINE[1])),
+             by = list(cf, DATA_INIZIO, DATA_FINE)]
 
   # Remove the grouping columns since they're duplicated
-  pol <- unique(pol[, .(cf, DATA_INIZIO, DATA_FINE, descrizione)])
+  pol <- unique(pol[, list(cf, DATA_INIZIO, DATA_FINE, descrizione)])
 
   cat(sprintf("  Loaded %s POL records (aggregated by person-date)\n",
               format(nrow(pol), big.mark = ",")))
@@ -122,7 +231,7 @@ harmonize_contract_codes <- function(dt, tipo_contratto) {
   n_before <- length(unique(dt$COD_TIPOLOGIA_CONTRATTUALE))
 
   # Create harmonization mapping
-  harmonization_map <- tipo_contratto[, .(COD_TIPOLOGIA_CONTRATTUALE, TIPOLOGIA_CONTRATTUALE)]
+  harmonization_map <- tipo_contratto[, list(COD_TIPOLOGIA_CONTRATTUALE, TIPOLOGIA_CONTRATTUALE)]
 
   # Merge to apply harmonization
   dt <- merge(dt, harmonization_map, by = "COD_TIPOLOGIA_CONTRATTUALE", all.x = TRUE)
@@ -132,8 +241,8 @@ harmonize_contract_codes <- function(dt, tipo_contratto) {
 
   # Add labels
   etichette_contratti <- tipo_contratto[COD_TIPOLOGIA_CONTRATTUALE == TIPOLOGIA_CONTRATTUALE,
-                                        .(COD_TIPOLOGIA_CONTRATTUALE = TIPOLOGIA_CONTRATTUALE,
-                                          DES_TIPOCONTRATTI)]
+                                        list(COD_TIPOLOGIA_CONTRATTUALE = TIPOLOGIA_CONTRATTUALE,
+                                             DES_TIPOCONTRATTI)]
   dt <- merge(dt, etichette_contratti, by = "COD_TIPOLOGIA_CONTRATTUALE", all.x = TRUE)
   data.table::setDT(dt)  # Ensure dt is data.table after merge
 
@@ -231,6 +340,106 @@ filter_by_location <- function(dt, filter_by = c("residence", "workplace"), terr
 }
 
 
+# 2. Post-vecshift geographic filtering -----
+
+#' Filter vecshift output by geography (before adding unemployment)
+#'
+#' CRITICAL FIX: Vecshift drops all columns except cf, inizio, fine, prior, id, arco, durata.
+#' This function needs contracts_prepared_unfiltered to access COMUNE_LAVORATORE and COMUNE_SEDE_LAVORO.
+#' It joins back to prepared data via the 'id' column to get location information for filtering.
+#'
+#' @param dt data.table from vecshift (employment only, minimal skeleton)
+#' @param filter_by "residence" or "workplace"
+#' @param territoriale Geographic lookup table from classifiers
+#' @param contracts_prepared_unfiltered Original prepared data with location columns
+#' @return Filtered data.table with only Lombardia records (still minimal skeleton)
+#' @export
+filter_vecshift_by_geography <- function(dt, filter_by = c("residence", "workplace"),
+                                          territoriale, contracts_prepared_unfiltered) {
+  filter_by <- match.arg(filter_by)
+
+  cat(sprintf("Filtering vecshift output by %s location...\n", filter_by))
+
+  location_col <- switch(filter_by,
+    residence = "COMUNE_LAVORATORE",
+    workplace = "COMUNE_SEDE_LAVORO")
+
+  # Get Lombardia comuni
+  lombardia_comuni <- unique(territoriale[
+    DES_REGIONE_PAUT == "LOMBARDIA", list(COD_COMUNE)])
+
+  n_before <- nrow(dt)
+
+  # CRITICAL FIX: Join back to original prepared data to get location column
+  # vecshift output only has: cf, inizio, fine, prior, id, arco, durata
+  # We need to get location from contracts_prepared_unfiltered via 'id' column
+
+  # DIAGNOSTIC: Check if 'id' column exists in contracts_prepared_unfiltered
+  if (!"id" %in% names(contracts_prepared_unfiltered)) {
+    stop("ERROR: 'id' column not found in contracts_prepared_unfiltered.\n",
+         "Available columns: ", paste(names(contracts_prepared_unfiltered), collapse = ", "),
+         "\nThis is likely because ID_RAPPORTO was not present in the raw data.")
+  }
+
+  # Extract just id and location from prepared data
+  location_lookup <- contracts_prepared_unfiltered[, list(id,
+                                                           COMUNE_LAVORATORE,
+                                                           COMUNE_SEDE_LAVORO)]
+
+  # Merge location info to vecshift skeleton
+  dt_with_location <- merge(dt, location_lookup, by = "id", all.x = TRUE)
+  data.table::setDT(dt_with_location)
+
+  # Now filter by the selected location column
+  dt_filtered <- dt_with_location[get(location_col) %chin% lombardia_comuni$COD_COMUNE]
+
+  # Drop location columns to return to minimal skeleton format
+  # (they'll be merged back later in merge_attributes_only)
+  dt_filtered[, c("COMUNE_LAVORATORE", "COMUNE_SEDE_LAVORO") := NULL]
+
+  n_after <- nrow(dt_filtered)
+  pct_retained <- 100 * n_after / n_before
+
+  cat(sprintf("  Filtered by %s: %s -> %s rows (%.1f%% retained)\n",
+              filter_by,
+              format(n_before, big.mark = ","),
+              format(n_after, big.mark = ","),
+              pct_retained))
+
+  # Set key for downstream performance
+  data.table::setkey(dt_filtered, cf, inizio, fine)
+
+  return(dt_filtered)
+}
+
+
+#' Zero working hours for excluded contract types
+#'
+#' Sets working hours to 0 for contract types that should not contribute
+#' to FTE calculations: tirocinio (internship), intermittente (on-call),
+#' and parasubordinati (co.co.co).
+#'
+#' @param dt data.table with COD_TIPOLOGIA_CONTRATTUALE and ORE_SETTIM_MEDIE columns
+#' @return data.table with modified ORE_SETTIM_MEDIE
+#' @export
+zero_hours_for_excluded_contracts <- function(dt) {
+  # Contract codes to exclude from FTE calculations:
+  # G.03.00 = Tirocinio (internship)
+  # A.05.02 = Lavoro Intermittente (on-call)
+  # C.01.00 = Collaborazione Coordinata Continuativa (co.co.co/parasubordinati)
+  excluded_codes <- c("G.03.00", "A.05.02", "C.01.00")
+
+  n_affected <- sum(dt$COD_TIPOLOGIA_CONTRATTUALE %in% excluded_codes, na.rm = TRUE)
+
+  dt[COD_TIPOLOGIA_CONTRATTUALE %in% excluded_codes, ORE_SETTIM_MEDIE := 0]
+
+  cat(sprintf("  Set working hours to 0 for %s contracts (tirocinio/intermittente/parasubordinati)\n",
+              format(n_affected, big.mark = ",")))
+
+  return(dt)
+}
+
+
 #' Standardize education level variable
 #'
 #' @param dt data.table with LIV_ISTRUZIONE_LAV column
@@ -283,13 +492,16 @@ prepare_contracts <- function(raw_contracts, classifiers) {
   # Step 1: Harmonize contract codes
   dt <- harmonize_contract_codes(dt, classifiers$tipo_contratto)
 
-  # Step 2: Filter to Lombardia (either residence OR workplace in Lombardia)
+  # Step 2: Zero working hours for excluded contract types
+  dt <- zero_hours_for_excluded_contracts(dt)
+
+  # Step 3: Filter to Lombardia (either residence OR workplace in Lombardia)
   # This keeps all contracts relevant to Lombardia without choosing which filter yet
   cat("Filtering to contracts with Lombardia connection...\n")
 
   lombardia_comuni <- unique(classifiers$territoriale[
     DES_REGIONE_PAUT == "LOMBARDIA",
-    .(COD_COMUNE)
+    list(COD_COMUNE)
   ])
 
   n_before <- nrow(dt)
@@ -306,12 +518,12 @@ prepare_contracts <- function(raw_contracts, classifiers) {
               format(n_after, big.mark = ","),
               pct_retained))
 
-  # Step 3: Add geographic information (provincia) for both locations
+  # Step 4: Add geographic information (provincia) for both locations
   cat("Adding provincia information...\n")
 
   # Add provincia for workplace
   prov_lookup <- unique(classifiers$territoriale[,
-    .(COD_COMUNE, DES_PROVINCIA_SEDE = DES_PROVINCIA)
+    list(COD_COMUNE, DES_PROVINCIA_SEDE = DES_PROVINCIA)
   ])
 
   dt <- merge(dt, prov_lookup,
@@ -320,12 +532,31 @@ prepare_contracts <- function(raw_contracts, classifiers) {
               all.x = TRUE)
   data.table::setDT(dt)  # Ensure dt is data.table after merge
 
-  # Step 4: Standardize education
+  # Step 5: Standardize education
   dt <- standardize_education(dt)
 
-  # Step 5: Select relevant columns
+  # Step 6: Select relevant columns
   cat("Selecting final column set...\n")
-  dt <- dt[, .(
+
+  # CRITICAL FIX: Check if ID_RAPPORTO exists, if not create it
+  if (!"ID_RAPPORTO" %in% names(dt)) {
+    cat("  WARNING: ID_RAPPORTO not found in raw data, creating sequential IDs...\n")
+    dt[, ID_RAPPORTO := .I]  # Create sequential row IDs
+  }
+
+  # CRITICAL FIX: Check if troncata exists, if not create it
+  if (!"troncata" %in% names(dt)) {
+    cat("  WARNING: troncata column not found, setting to FALSE...\n")
+    dt[, troncata := FALSE]
+  }
+
+  # CRITICAL FIX: Check if cfd exists, if not create it as NA
+  if (!"cfd" %in% names(dt)) {
+    cat("  WARNING: cfd (employer ID) column not found, setting to NA...\n")
+    dt[, cfd := NA_character_]
+  }
+
+  dt <- dt[, list(
     cf,
     inizio = INIZIO,  # Lowercase for vecshift compatibility
     fine = FINE,      # Lowercase for vecshift compatibility
@@ -485,9 +716,12 @@ pipeline_merge_attributes <- function(data_with_unemployment, prepared_data) {
 #' @param data_with_unemployment Data from pipeline_add_unemployment()
 #' @param did_data DID data from load_raw_did()
 #' @param pol_data POL data from load_raw_pol()
+#' @param min_date Minimum date for filtering DID/POL events (default: NULL = no filter)
+#' @param max_date Maximum date for filtering DID/POL events (default: NULL = no filter)
 #' @return data.table with DID/POL flags on unemployment spells
 #' @export
-pipeline_match_events <- function(data_with_unemployment, did_data, pol_data) {
+pipeline_match_events <- function(data_with_unemployment, did_data, pol_data,
+                                   min_date = NULL, max_date = NULL) {
 
   cat("=" %+% rep("=", 50) %+% "\n")
   cat("MATCHING EXTERNAL EVENTS (DID/POL)\n")
@@ -496,6 +730,22 @@ pipeline_match_events <- function(data_with_unemployment, did_data, pol_data) {
   # Work directly with data_with_unemployment (no copy to avoid reference issues)
   dt <- data_with_unemployment
   data.table::setDT(dt)  # Ensure dt is data.table
+  data.table::setDT(did_data)
+  data.table::setDT(pol_data)
+
+  # Filter DID/POL data by date range to reduce memory usage
+  if (!is.null(min_date)) {
+    n_did_before <- nrow(did_data)
+    n_pol_before <- nrow(pol_data)
+    did_data <- did_data[DATA_EVENTO >= min_date]
+    pol_data <- pol_data[DATA_INIZIO >= min_date | DATA_FINE >= min_date]
+    cat(sprintf("  Date filter (>= %s): DID %s → %s, POL %s → %s\n",
+                min_date,
+                format(n_did_before, big.mark = ","),
+                format(nrow(did_data), big.mark = ","),
+                format(n_pol_before, big.mark = ","),
+                format(nrow(pol_data), big.mark = ",")))
+  }
 
   # WORKAROUND: Convert IDate to base R Date to avoid IDate storage mode bug in vecshift
   # This sacrifices IDate efficiency but ensures compatibility with vecshift operations
@@ -517,15 +767,55 @@ pipeline_match_events <- function(data_with_unemployment, did_data, pol_data) {
     id_evento = seq_len(nrow(did_data))
   )
 
-  # Add DID events
-  cat("  Matching DID to unemployment spells...\n")
-  dt <- vecshift::add_external_events(
-    dt,
-    external_events = did_events,
-    event_matching_strategy = "overlap",
-    create_synthetic_unemployment = TRUE,
-    synthetic_unemployment_duration = 730L  # 2 years
-  )
+  # MEMORY OPTIMIZATION: Batch DID matching (same pattern as POL)
+  # Pre-filter DID to CFs in employment data
+  cfs_in_dt <- as.character(unique(dt$cf))  # Ensure character for %chin%
+  n_did_before <- nrow(did_events)
+  did_events <- did_events[cf %chin% cfs_in_dt]
+  cat(sprintf("  CF filter: DID %s → %s (%.1f%% reduction)\n",
+              format(n_did_before, big.mark = ","),
+              format(nrow(did_events), big.mark = ","),
+              100 * (n_did_before - nrow(did_events)) / n_did_before))
+
+  # Process DID in batches
+  batch_size_did <- 50000L  # CFs per batch
+  cf_batches_did <- split(cfs_in_dt, ceiling(seq_along(cfs_in_dt) / batch_size_did))
+  n_batches_did <- length(cf_batches_did)
+
+  cat(sprintf("  Processing %d batches of ~%s CFs each...\n",
+              n_batches_did, format(batch_size_did, big.mark = ",")))
+
+  result_list_did <- vector("list", n_batches_did)
+
+  for (i in seq_len(n_batches_did)) {
+    batch_cfs <- as.character(cf_batches_did[[i]])  # Ensure character for %chin%
+    dt_batch <- dt[cf %chin% batch_cfs]
+    did_batch <- did_events[cf %chin% batch_cfs]
+
+    if (nrow(did_batch) > 0) {
+      dt_batch <- vecshift::add_external_events(
+        dt_batch,
+        external_events = did_batch,
+        event_matching_strategy = "overlap",
+        create_synthetic_unemployment = TRUE,
+        synthetic_unemployment_duration = 730L  # 2 years
+      )
+    } else {
+      # No DID for this batch - initialize columns
+      dt_batch[, `:=`(did_attribute = NA_character_, did_match_quality = NA_character_)]
+    }
+
+    result_list_did[[i]] <- dt_batch
+
+    if (i %% 10 == 0 || i == n_batches_did) {
+      cat(sprintf("    Batch %d/%d complete\n", i, n_batches_did))
+      gc()
+    }
+  }
+
+  dt <- data.table::rbindlist(result_list_did, use.names = TRUE, fill = TRUE)
+  rm(result_list_did, did_events, cf_batches_did)
+  gc()
 
   n_did_matched <- sum(!is.na(dt$did_attribute))
   cat(sprintf("  ✓ Matched %s DID events\n", format(n_did_matched, big.mark = ",")))
@@ -538,34 +828,120 @@ pipeline_match_events <- function(data_with_unemployment, did_data, pol_data) {
   # Prepare POL data (interval events with start and end dates)
   cat("\nProcessing POL events...\n")
 
-  # WORKAROUND: Convert back to Date for POL matching
-  dt[, inizio := as.Date(inizio)]
-  dt[, fine := as.Date(fine)]
+  # MEMORY OPTIMIZATION: Two-phase batched processing
+  # Phase A: Process POL for CFs in employment data (batched vecshift)
+  # Phase B: Create synthetic unemployment for POL-only CFs
 
-  # Create new data.table with renamed columns for vecshift
-  # Cap end dates at max observation date
-  # WORKAROUND: Use Date instead of IDate to avoid storage mode bug
-  pol_events <- data.table::data.table(
-    cf = pol_data$cf,
-    event_start = as.Date(pol_data$DATA_INIZIO),
-    event_end = as.Date(pmin(pol_data$DATA_FINE, as.Date("2024-12-31"))),
-    descrizione = pol_data$descrizione,
-    event_name = "pol",
-    id_evento = seq_len(nrow(pol_data))
-  )
+  # MEMORY OPTIMIZATION: Identify POL-only CFs BEFORE filtering (avoid full copy)
+  cfs_in_dt <- as.character(unique(dt$cf))  # Ensure character for %chin%
+  cfs_only_in_pol <- as.character(setdiff(unique(pol_data$cf), cfs_in_dt))  # Ensure character
+  pol_only <- pol_data[cf %chin% cfs_only_in_pol]  # Keep only POL-only records
+  cat(sprintf("  POL-only CFs identified: %s (kept %s records for Phase B)\n",
+              format(length(cfs_only_in_pol), big.mark = ","),
+              format(nrow(pol_only), big.mark = ",")))
 
-  # Add POL events
-  cat("  Matching POL to unemployment spells...\n")
-  dt <- vecshift::add_external_events(
-    dt,
-    external_events = pol_events,
-    event_matching_strategy = "overlap",
-    create_synthetic_unemployment = TRUE,
-    synthetic_unemployment_duration = 730L  # 2 years
-  )
+  # 1. Pre-filter POL to CFs in employment data
+  n_pol_before <- nrow(pol_data)
+  pol_data <- pol_data[cf %chin% cfs_in_dt]
+  cat(sprintf("  CF filter: POL %s → %s (%.1f%% reduction)\n",
+              format(n_pol_before, big.mark = ","),
+              format(nrow(pol_data), big.mark = ","),
+              100 * (n_pol_before - nrow(pol_data)) / n_pol_before))
+
+  # 2. Process in batches (Phase A)
+  batch_size <- 50000L  # CFs per batch (reduced from 100k for memory efficiency)
+  cf_batches <- split(cfs_in_dt, ceiling(seq_along(cfs_in_dt) / batch_size))
+  n_batches <- length(cf_batches)
+
+  cat(sprintf("  Processing %d batches of ~%s CFs each...\n",
+              n_batches, format(batch_size, big.mark = ",")))
+
+  result_list <- vector("list", n_batches)
+
+  for (i in seq_len(n_batches)) {
+    batch_cfs <- as.character(cf_batches[[i]])  # Ensure character for %chin%
+    dt_batch <- dt[cf %chin% batch_cfs]
+    pol_batch <- pol_data[cf %chin% batch_cfs]
+
+    if (nrow(pol_batch) > 0) {
+      # Convert to Date for vecshift
+      dt_batch[, inizio := as.Date(inizio)]
+      dt_batch[, fine := as.Date(fine)]
+
+      pol_events <- data.table::data.table(
+        cf = pol_batch$cf,
+        event_start = as.Date(pol_batch$DATA_INIZIO),
+        event_end = as.Date(pmin(pol_batch$DATA_FINE, as.Date("2024-12-31"))),
+        descrizione = pol_batch$descrizione,
+        event_name = "pol",
+        id_evento = seq_len(nrow(pol_batch))
+      )
+
+      dt_batch <- vecshift::add_external_events(
+        dt_batch,
+        external_events = pol_events,
+        event_matching_strategy = "overlap",
+        create_synthetic_unemployment = TRUE,
+        synthetic_unemployment_duration = 730L
+      )
+
+      # Convert back to IDate
+      dt_batch[, inizio := data.table::as.IDate(inizio)]
+      dt_batch[, fine := data.table::as.IDate(fine)]
+    } else {
+      # No POL for this batch - initialize columns
+      dt_batch[, `:=`(pol_attribute = NA_character_, pol_match_quality = NA_character_)]
+    }
+
+    result_list[[i]] <- dt_batch
+
+    if (i %% 10 == 0) {
+      cat(sprintf("    Batch %d/%d complete\n", i, n_batches))
+      gc()
+    }
+  }
+
+  dt <- data.table::rbindlist(result_list, use.names = TRUE, fill = TRUE)
+  rm(result_list)
+  gc()
+
+  # Phase B: Create synthetic unemployment for POL-only CFs
+  # These CFs have POL participation but no employment contracts
+  # (pol_only and cfs_only_in_pol already computed above to avoid full data copy)
+
+  if (nrow(pol_only) > 0) {
+    cat(sprintf("  Phase B: Creating synthetic unemployment for %s POL-only CFs...\n",
+                format(length(cfs_only_in_pol), big.mark = ",")))
+
+    # Create one synthetic unemployment spell per CF covering their POL period
+    synthetic_pol <- pol_only[, list(
+      inizio = min(DATA_INIZIO),
+      fine = pmin(max(DATA_FINE), as.IDate("2024-12-31")),
+      pol_attribute = paste(unique(descrizione), collapse = "; ")
+    ), by = cf]
+
+    # Add required columns
+    synthetic_pol[, `:=`(
+      arco = 0L,
+      durata = as.integer(fine - inizio),
+      pol_match_quality = "synthetic_pol_only",
+      did_attribute = NA_character_,
+      did_match_quality = NA_character_
+    )]
+
+    # Fill missing columns from dt with NA
+    missing_cols <- setdiff(names(dt), names(synthetic_pol))
+    for (col in missing_cols) {
+      synthetic_pol[, (col) := NA]
+    }
+
+    dt <- data.table::rbindlist(list(dt, synthetic_pol), use.names = TRUE, fill = TRUE)
+    cat(sprintf("  ✓ Added %s synthetic unemployment spells for POL-only CFs\n",
+                format(nrow(synthetic_pol), big.mark = ",")))
+  }
 
   n_pol_matched <- sum(!is.na(dt$pol_attribute))
-  cat(sprintf("  ✓ Matched %s POL events\n", format(n_pol_matched, big.mark = ",")))
+  cat(sprintf("  ✓ Total POL matched: %s\n", format(n_pol_matched, big.mark = ",")))
 
   # Convert back to IDate after all vecshift operations
   cat("\n  Converting Date → IDate (final conversion)...\n")
@@ -573,6 +949,241 @@ pipeline_match_events <- function(data_with_unemployment, did_data, pol_data) {
   dt[, fine := data.table::as.IDate(fine)]
 
   cat("\n✓ External event matching complete\n")
+  cat("=" %+% rep("=", 50) %+% "\n\n")
+
+  return(dt)
+}
+
+
+#' Match DID and POL events with memory-safe mode
+#'
+#' Memory-optimized version that enables vecshift's memory_safe mode and
+#' uses smaller batch sizes (25k CFs instead of 50k).
+#'
+#' @param data_with_unemployment Data from pipeline_add_unemployment()
+#' @param did_data DID data from load_raw_did()
+#' @param pol_data POL data from load_raw_pol()
+#' @param min_date Minimum date for filtering DID/POL events
+#' @param max_date Maximum date for filtering DID/POL events
+#' @return data.table with DID/POL flags on unemployment spells
+#' @export
+pipeline_match_events_memory_safe <- function(data_with_unemployment, did_data, pol_data,
+                                               min_date = NULL, max_date = NULL) {
+
+  cat("=" %+% rep("=", 50) %+% "\n")
+  cat("MATCHING EXTERNAL EVENTS (DID/POL) - MEMORY SAFE MODE\n")
+  cat("=" %+% rep("=", 50) %+% "\n")
+
+  # Work directly with data_with_unemployment
+  dt <- data_with_unemployment
+  data.table::setDT(dt)
+  data.table::setDT(did_data)
+  data.table::setDT(pol_data)
+
+  # Filter DID/POL data by date range
+  if (!is.null(min_date)) {
+    n_did_before <- nrow(did_data)
+    n_pol_before <- nrow(pol_data)
+    did_data <- did_data[DATA_EVENTO >= min_date]
+    pol_data <- pol_data[DATA_INIZIO >= min_date | DATA_FINE >= min_date]
+    cat(sprintf("  Date filter (>= %s): DID %s → %s, POL %s → %s\n",
+                min_date,
+                format(n_did_before, big.mark = ","),
+                format(nrow(did_data), big.mark = ","),
+                format(n_pol_before, big.mark = ","),
+                format(nrow(pol_data), big.mark = ",")))
+  }
+
+  # Convert IDate → Date for vecshift compatibility
+  cat("  Converting IDate → Date for vecshift compatibility...\n")
+  dt[, inizio := as.Date(inizio)]
+  dt[, fine := as.Date(fine)]
+
+  # Prepare DID data
+  cat("\nProcessing DID events (memory-safe mode)...\n")
+
+  did_events <- data.table::data.table(
+    cf = did_data$cf,
+    event_start = as.Date(did_data$DATA_EVENTO),
+    event_end = as.Date(did_data$DATA_EVENTO),
+    DID_NASPI = did_data$DID_NASPI,
+    event_name = "did",
+    id_evento = seq_len(nrow(did_data))
+  )
+
+  # MEMORY OPTIMIZATION: Pre-filter and batch with smaller size
+  cfs_in_dt <- as.character(unique(dt$cf))
+  n_did_before <- nrow(did_events)
+  did_events <- did_events[cf %chin% cfs_in_dt]
+  cat(sprintf("  CF filter: DID %s → %s (%.1f%% reduction)\n",
+              format(n_did_before, big.mark = ","),
+              format(nrow(did_events), big.mark = ","),
+              100 * (n_did_before - nrow(did_events)) / n_did_before))
+
+  # Process DID in smaller batches (25k instead of 50k)
+  batch_size_did <- 25000L  # Reduced from 50k for memory safety
+  cf_batches_did <- split(cfs_in_dt, ceiling(seq_along(cfs_in_dt) / batch_size_did))
+  n_batches_did <- length(cf_batches_did)
+
+  cat(sprintf("  Processing %d batches of ~%s CFs each (memory-safe)...\n",
+              n_batches_did, format(batch_size_did, big.mark = ",")))
+
+  result_list_did <- vector("list", n_batches_did)
+
+  for (i in seq_len(n_batches_did)) {
+    batch_cfs <- as.character(cf_batches_did[[i]])
+    dt_batch <- dt[cf %chin% batch_cfs]
+    did_batch <- did_events[cf %chin% batch_cfs]
+
+    if (nrow(did_batch) > 0) {
+      # Use memory_safe mode with smaller chunks
+      dt_batch <- vecshift::add_external_events(
+        dt_batch,
+        external_events = did_batch,
+        event_matching_strategy = "overlap",
+        create_synthetic_unemployment = TRUE,
+        synthetic_unemployment_duration = 730L,
+        memory_safe = TRUE,   # MEMORY OPTIMIZATION
+        chunk_size = 5000L    # Smaller chunks (default is 10000)
+      )
+    } else {
+      dt_batch[, `:=`(did_attribute = NA_character_, did_match_quality = NA_character_)]
+    }
+
+    result_list_did[[i]] <- dt_batch
+
+    # More frequent gc() for memory safety
+    if (i %% 5 == 0 || i == n_batches_did) {
+      cat(sprintf("    Batch %d/%d complete\n", i, n_batches_did))
+      gc()
+    }
+  }
+
+  dt <- data.table::rbindlist(result_list_did, use.names = TRUE, fill = TRUE)
+  rm(result_list_did, did_events, cf_batches_did)
+  gc()
+
+  n_did_matched <- sum(!is.na(dt$did_attribute))
+  cat(sprintf("  ✓ Matched %s DID events\n", format(n_did_matched, big.mark = ",")))
+
+  # Convert back to IDate
+  dt[, inizio := data.table::as.IDate(inizio)]
+  dt[, fine := data.table::as.IDate(fine)]
+
+  # Process POL events
+  cat("\nProcessing POL events (memory-safe mode)...\n")
+
+  # Identify POL-only CFs BEFORE filtering
+  cfs_in_dt <- as.character(unique(dt$cf))
+  cfs_only_in_pol <- as.character(setdiff(unique(pol_data$cf), cfs_in_dt))
+  pol_only <- pol_data[cf %chin% cfs_only_in_pol]
+  cat(sprintf("  POL-only CFs identified: %s (kept %s records for Phase B)\n",
+              format(length(cfs_only_in_pol), big.mark = ","),
+              format(nrow(pol_only), big.mark = ",")))
+
+  # Pre-filter POL to CFs in employment data
+  n_pol_before <- nrow(pol_data)
+  pol_data <- pol_data[cf %chin% cfs_in_dt]
+  cat(sprintf("  CF filter: POL %s → %s (%.1f%% reduction)\n",
+              format(n_pol_before, big.mark = ","),
+              format(nrow(pol_data), big.mark = ","),
+              100 * (n_pol_before - nrow(pol_data)) / n_pol_before))
+
+  # Process POL in smaller batches
+  batch_size <- 25000L  # Reduced from 50k
+  cf_batches <- split(cfs_in_dt, ceiling(seq_along(cfs_in_dt) / batch_size))
+  n_batches <- length(cf_batches)
+
+  cat(sprintf("  Processing %d batches of ~%s CFs each (memory-safe)...\n",
+              n_batches, format(batch_size, big.mark = ",")))
+
+  result_list <- vector("list", n_batches)
+
+  for (i in seq_len(n_batches)) {
+    batch_cfs <- as.character(cf_batches[[i]])
+    dt_batch <- dt[cf %chin% batch_cfs]
+    pol_batch <- pol_data[cf %chin% batch_cfs]
+
+    if (nrow(pol_batch) > 0) {
+      dt_batch[, inizio := as.Date(inizio)]
+      dt_batch[, fine := as.Date(fine)]
+
+      pol_events <- data.table::data.table(
+        cf = pol_batch$cf,
+        event_start = as.Date(pol_batch$DATA_INIZIO),
+        event_end = as.Date(pmin(pol_batch$DATA_FINE, as.Date("2024-12-31"))),
+        descrizione = pol_batch$descrizione,
+        event_name = "pol",
+        id_evento = seq_len(nrow(pol_batch))
+      )
+
+      # Use memory_safe mode
+      dt_batch <- vecshift::add_external_events(
+        dt_batch,
+        external_events = pol_events,
+        event_matching_strategy = "overlap",
+        create_synthetic_unemployment = TRUE,
+        synthetic_unemployment_duration = 730L,
+        memory_safe = TRUE,   # MEMORY OPTIMIZATION
+        chunk_size = 5000L    # Smaller chunks
+      )
+
+      dt_batch[, inizio := data.table::as.IDate(inizio)]
+      dt_batch[, fine := data.table::as.IDate(fine)]
+    } else {
+      dt_batch[, `:=`(pol_attribute = NA_character_, pol_match_quality = NA_character_)]
+    }
+
+    result_list[[i]] <- dt_batch
+
+    # More frequent gc()
+    if (i %% 5 == 0 || i == n_batches) {
+      cat(sprintf("    Batch %d/%d complete\n", i, n_batches))
+      gc()
+    }
+  }
+
+  dt <- data.table::rbindlist(result_list, use.names = TRUE, fill = TRUE)
+  rm(result_list)
+  gc()
+
+  # Phase B: Synthetic unemployment for POL-only CFs
+  if (nrow(pol_only) > 0) {
+    cat(sprintf("  Phase B: Creating synthetic unemployment for %s POL-only CFs...\n",
+                format(length(cfs_only_in_pol), big.mark = ",")))
+
+    synthetic_pol <- pol_only[, list(
+      inizio = min(DATA_INIZIO),
+      fine = pmin(max(DATA_FINE), as.IDate("2024-12-31")),
+      pol_attribute = paste(unique(descrizione), collapse = "; ")
+    ), by = cf]
+
+    synthetic_pol[, `:=`(
+      arco = 0L,
+      durata = as.integer(fine - inizio),
+      pol_match_quality = "synthetic_pol_only",
+      did_attribute = NA_character_,
+      did_match_quality = NA_character_
+    )]
+
+    missing_cols <- setdiff(names(dt), names(synthetic_pol))
+    for (col in missing_cols) {
+      synthetic_pol[, (col) := NA]
+    }
+
+    dt <- data.table::rbindlist(list(dt, synthetic_pol), use.names = TRUE, fill = TRUE)
+    cat(sprintf("  ✓ Added %s synthetic unemployment spells for POL-only CFs\n",
+                format(nrow(synthetic_pol), big.mark = ",")))
+  }
+
+  n_pol_matched <- sum(!is.na(dt$pol_attribute))
+  cat(sprintf("  ✓ Total POL matched: %s\n", format(n_pol_matched, big.mark = ",")))
+
+  # Final IDate conversion
+  dt[, inizio := data.table::as.IDate(inizio)]
+  dt[, fine := data.table::as.IDate(fine)]
+
+  cat("\n✓ External event matching complete (memory-safe mode)\n")
   cat("=" %+% rep("=", 50) %+% "\n\n")
 
   return(dt)
